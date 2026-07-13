@@ -53,3 +53,7 @@ jobs:
 
       - name: Enforce line coverage
         run: vendor/bin/pest --coverage --min=80 --only-summary-for-coverage-text
+
+      - name: Analyse lowest supported Laravel
+        if: matrix.platform == 'Linux'
+        run: composer analyse

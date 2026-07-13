@@ -11,22 +11,8 @@ permissions:
 
 jobs:
   tests:
-    name: Laravel ${{ matrix.laravel }}
+    name: Laravel latest
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - laravel: '12.61.1'
-            composer-arguments: >-
-              --with laravel/framework:12.61.1
-              --with-all-dependencies
-              --prefer-stable
-          - laravel: latest
-            composer-arguments: >-
-              --with-all-dependencies
-              --prefer-stable
 
     steps:
       - name: Checkout
@@ -45,7 +31,8 @@ jobs:
       - name: Install dependencies
         run: >-
           composer update
-          ${{ matrix.composer-arguments }}
+          --with-all-dependencies
+          --prefer-stable
           --no-interaction
           --no-progress
 

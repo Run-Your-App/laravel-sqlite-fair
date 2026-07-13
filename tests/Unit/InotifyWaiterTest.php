@@ -14,8 +14,11 @@ it('arms and consumes real single and coalesced inotify directory events on linu
     mkdir($directory, 0775, true);
     $blockedResult = null;
     $select = static function (array &$read, array &$write, array &$except, int $seconds, int $microseconds) use (&$blockedResult, $directory, $events): int|false {
-        for ($event = 0; $event < $events; $event++) { touch($directory.'/event-'.$event); }
+        for ($event = 0; $event < $events; $event++) {
+            touch($directory.'/event-'.$event);
+        }
         $blockedResult = stream_select($read, $write, $except, $seconds, $microseconds);
+
         return $blockedResult;
     };
     $waiter = new InotifyWaiter($directory, false, $select);

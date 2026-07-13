@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
 use FFI;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
 
@@ -45,6 +46,8 @@ final class KqueueWaiter implements Waiter
 
     private bool $armedOnce = false;
 
+    private ?PollingWaiter $polling = null;
+
     /** @var callable(FFI, string, mixed ...): int */
     private $systemCall;
 
@@ -58,7 +61,8 @@ final class KqueueWaiter implements Waiter
      * @param  string  $directory  Existing absolute lock directory to observe.
      * @param  bool  $allowPostArmPolling  Whether a later native failure may switch this adapter to polling.
      * @param  null|callable(FFI, string, mixed ...): int  $systemCall  Internal deterministic system-call seam.
-     * @return void
+     * @param  bool  $debug  Whether post-arm degradation emits a structured debug log.
+     * @return void The adapter owns an armed kqueue and directory descriptor.
      *
      * @throws RuntimeException When FFI, kqueue, the directory descriptor, or initial registration is unavailable.
      */
@@ -66,6 +70,7 @@ final class KqueueWaiter implements Waiter
         string $directory,
         private readonly bool $allowPostArmPolling = false,
         ?callable $systemCall = null,
+        private readonly bool $debug = false,
     ) {
         if (! class_exists(FFI::class)) {
             throw new RuntimeException('FFI is required for native Darwin waiting.');
@@ -87,7 +92,7 @@ final class KqueueWaiter implements Waiter
     /**
      * Closes the directory and kqueue descriptors owned by this adapter.
      *
-     * @return void
+     * @return void Both owned descriptors have been closed.
      *
      * @throws RuntimeException When the configured system-call boundary cannot close a descriptor.
      */
@@ -133,7 +138,7 @@ final class KqueueWaiter implements Waiter
      * one successful arm switches auto mode permanently to polling; startup and
      * native-mode failures throw without creating a fallback path.
      *
-     * @return void
+     * @return void The vnode watch is armed, or the permitted polling fallback is active.
      *
      * @throws RuntimeException When the vnode watch cannot be registered and degradation is not allowed.
      */
@@ -146,6 +151,7 @@ final class KqueueWaiter implements Waiter
         if ($this->integerCall('kevent', $this->queue, FFI::addr($change), 1, null, 0, null) < 0) {
             if ($this->allowPostArmPolling && $this->armedOnce) {
                 $this->degraded = true;
+                $this->debugDegradation('arm');
 
                 return;
             }
@@ -163,14 +169,14 @@ final class KqueueWaiter implements Waiter
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
-     * @return void
+     * @return void The event, bounded interval, or supplied deadline ended the wait.
      *
      * @throws RuntimeException When the native wait fails and degradation is not allowed.
      */
     public function block(?float $deadline, callable $monotonic): void
     {
         if ($this->degraded) {
-            (new PollingWaiter())->block($deadline, $monotonic);
+            ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
 
             return;
         }
@@ -186,7 +192,8 @@ final class KqueueWaiter implements Waiter
         if ($this->integerCall('kevent', $this->queue, null, 0, FFI::addr($event), 1, FFI::addr($timeout)) < 0) {
             if ($this->allowPostArmPolling) {
                 $this->degraded = true;
-                (new PollingWaiter())->block($deadline, $monotonic);
+                $this->debugDegradation('block');
+                ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
 
                 return;
             }
@@ -200,7 +207,7 @@ final class KqueueWaiter implements Waiter
      * A zero-valued timespec keeps this operation nonblocking. Degraded adapters
      * have no native queue to consume and therefore return without side effects.
      *
-     * @return void
+     * @return void Every vnode event currently buffered by kqueue has been consumed.
      *
      * @throws RuntimeException When the native event queue cannot be read.
      */
@@ -213,14 +220,28 @@ final class KqueueWaiter implements Waiter
         $timeout = $this->ffi->new('struct timespec');
         $timeout->tv_sec = 0;
         $timeout->tv_nsec = 0;
-        while ($this->integerCall('kevent', $this->queue, null, 0, FFI::addr($event), 1, FFI::addr($timeout)) > 0) {
+        while (true) {
+            $result = $this->integerCall('kevent', $this->queue, null, 0, FFI::addr($event), 1, FFI::addr($timeout));
+            if ($result > 0) {
+                continue;
+            }
+            if ($result === 0) {
+                return;
+            }
+            if ($this->allowPostArmPolling) {
+                $this->degraded = true;
+                $this->debugDegradation('drain');
+
+                return;
+            }
+
+            throw new RuntimeException('The kqueue event queue could not be drained.');
         }
     }
 
     /**
      * Creates the sole Darwin C-ABI binding used by capability and runtime paths.
      *
-     * @return FFI
      *
      * @throws RuntimeException When the process cannot load the declared libc symbols or C data structures.
      */
@@ -237,7 +258,6 @@ final class KqueueWaiter implements Waiter
      * Calls one declared Darwin function and requires its integer result.
      *
      * @param  mixed  ...$arguments  Native arguments matching the selected declaration.
-     * @return int
      *
      * @throws RuntimeException When the function is unavailable or returns an unexpected PHP type.
      */
@@ -283,5 +303,17 @@ final class KqueueWaiter implements Waiter
         $systemCall = $this->systemCall;
 
         return $systemCall($this->ffi, $function, ...$arguments);
+    }
+
+    /** Emit the single diagnostic allowed for automatic native degradation. */
+    private function debugDegradation(string $operation): void
+    {
+        if ($this->debug) {
+            try {
+                Log::debug('Fair SQLite transition.', ['event' => 'waiter_degraded', 'pid' => getmypid(), 'adapter' => 'kqueue', 'operation' => $operation, 'fallback' => 'polling']);
+            } catch (Throwable) {
+                // Optional diagnostics must never change waiter degradation.
+            }
+        }
     }
 }

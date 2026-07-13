@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\Log;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
@@ -14,8 +15,8 @@ it('bootstraps the exact lock schema and supports ordered ticket operations', fu
         $directory,
         new PollingWaiter(),
         static fn (): float => hrtime(true) / 1e9,
-        static function (string $path) use (&$owned): \PDO {
-            return $owned = new \PDO('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        static function (string $path) use (&$owned): PDO {
+            return $owned = new PDO('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         },
     );
 
@@ -29,8 +30,8 @@ it('bootstraps the exact lock schema and supports ordered ticket operations', fu
     $database->deleteExact($second);
     expect($database->readHead())->toBeNull();
 
-    expect($owned)->toBeInstanceOf(\PDO::class);
-    if (! $owned instanceof \PDO) {
+    expect($owned)->toBeInstanceOf(PDO::class);
+    if (! $owned instanceof PDO) {
         throw new RuntimeException('The injected PDO factory did not retain its handle.');
     }
     expect((int) $owned->query('PRAGMA busy_timeout')->fetchColumn())->toBe(0)
@@ -39,8 +40,38 @@ it('bootstraps the exact lock schema and supports ordered ticket operations', fu
         ->and((int) $owned->query('PRAGMA user_version')->fetchColumn())->toBe(1);
 });
 
+it('revalidates a concurrent bootstrap that commits between the autocommit prechecks', function () {
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/concurrent-bootstrap-precheck';
+    $state = (object) ['interleaved' => false];
+    $factory = static fn (string $path): PDO => new class($path, $directory, $state) extends PDO
+    {
+        public function __construct(string $path, private readonly string $directory, private readonly object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
+        {
+            if (! $this->state->interleaved && str_starts_with($query, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE")) {
+                $this->state->interleaved = true;
+                (new LockDatabase($this->directory, new PollingWaiter(), static fn (): float => 0.0))->open();
+            }
+
+            return parent::query($query, $fetchMode, ...$fetchModeArgs);
+        }
+    };
+    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0, $factory);
+
+    $database->open();
+
+    $verification = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    expect($state->interleaved)->toBeTrue()
+        ->and((int) $verification->query('PRAGMA user_version')->fetchColumn())->toBe(1)
+        ->and($verification->query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN))->toBe(['sqlite_sequence', 'tickets']);
+});
+
 it('classifies only numeric sqlite busy and locked base or extended codes', function (int $code, bool $expected) {
-    $exception = new \PDOException('irrelevant message', $code);
+    $exception = new PDOException('irrelevant message', $code);
     $exception->errorInfo = ['HY000', $code, 'irrelevant message'];
 
     expect(LockDatabase::isBusyOrLocked($exception))->toBe($expected);
@@ -60,7 +91,7 @@ it('uses an idempotent missing-row exact delete', function () {
 it('rejects an unknown schema version without changing it', function () {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/invalid-version';
     mkdir($directory, 0775, true);
-    $pdo = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('PRAGMA user_version=2');
@@ -73,7 +104,7 @@ it('rejects an unknown schema version without changing it', function () {
 it('rejects an unexpected bootstrap table without replacing it', function () {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/invalid-table';
     mkdir($directory, 0775, true);
-    $pdo = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE unexpected (id INTEGER PRIMARY KEY)');
@@ -85,23 +116,36 @@ it('rejects an unexpected bootstrap table without replacing it', function () {
 
 it('performs cleanup as one nonblocking attempt without waiter replay', function () {
     $waitState = (object) ['calls' => 0];
-    $waiter = new class($waitState) implements Waiter {
+    $waiter = new class($waitState) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->calls++; }
-        public function drain(): void { $this->state->calls++; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->calls++; }
+
+        public function arm(): void
+        {
+            $this->state->calls++;
+        }
+
+        public function drain(): void
+        {
+            $this->state->calls++;
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->calls++;
+        }
     };
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/cleanup-once';
     $database = new LockDatabase($directory, $waiter, static fn (): float => 0.0);
     $ticket = $database->admit();
-    $blocker = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $blocker = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $blocker->exec('PRAGMA busy_timeout=0');
-    $blocker->exec('BEGIN IMMEDIATE');
+    $blocker->exec('BEGIN EXCLUSIVE');
 
-    expect(fn () => $database->cleanupExact($ticket))->toThrow(\PDOException::class)
-        ->and($waitState->calls)->toBe(0)
-        ->and($database->readHead())->toBe($ticket);
+    expect(fn () => $database->cleanupExact($ticket))->toThrow(PDOException::class)
+        ->and($waitState->calls)->toBe(0);
     $blocker->rollBack();
+    expect($database->readHead())->toBe($ticket);
 });
 
 it('does not open a new handle for cleanup', function () {
@@ -110,9 +154,10 @@ it('does not open a new handle for cleanup', function () {
         $GLOBALS['sqliteFairTestRunDirectory'].'/cleanup-no-open',
         new PollingWaiter(),
         static fn (): float => 0.0,
-        static function (string $path) use (&$factoryCalls): \PDO {
+        static function (string $path) use (&$factoryCalls): PDO {
             $factoryCalls++;
-            return new \PDO('sqlite:'.$path);
+
+            return new PDO('sqlite:'.$path);
         },
     );
 
@@ -127,14 +172,17 @@ it('sets zero busy timeout first and completes pragma setup before bootstrap beg
         $directory,
         new PollingWaiter(),
         static fn (): float => 0.0,
-        static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+        static fn (string $path): PDO => new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION, \PDO::ATTR_STRINGIFY_FETCHES => false]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES => false]);
             }
+
             public function exec(string $statement): int|false
             {
                 $this->state->sql[] = $statement;
+
                 return parent::exec($statement);
             }
         },
@@ -142,33 +190,39 @@ it('sets zero busy timeout first and completes pragma setup before bootstrap beg
     $database->open();
 
     expect($state->sql[0])->toBe('PRAGMA busy_timeout=0')
-        ->and(array_search('PRAGMA journal_mode=DELETE', $state->sql, true))->toBeLessThan(array_search('BEGIN IMMEDIATE', $state->sql, true))
-        ->and(array_search('PRAGMA synchronous=NORMAL', $state->sql, true))->toBeLessThan(array_search('BEGIN IMMEDIATE', $state->sql, true));
+        ->and(array_search('PRAGMA journal_mode=DELETE', $state->sql, true))->toBeLessThan(array_search('BEGIN EXCLUSIVE', $state->sql, true))
+        ->and(array_search('PRAGMA synchronous=NORMAL', $state->sql, true))->toBeLessThan(array_search('BEGIN EXCLUSIVE', $state->sql, true));
 });
 
 it('does not replay admission after an unknown commit and reopens only on a later call', function () {
     $state = (object) ['factory' => 0, 'throwCommit' => false, 'inserts' => 0];
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/admission-commit-unknown';
-    $factory = static function (string $path) use ($state): \PDO {
+    $factory = static function (string $path) use ($state): PDO {
         $state->factory++;
-        return new class($path, $state) extends \PDO {
+
+        return new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION, \PDO::ATTR_STRINGIFY_FETCHES => false]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES => false]);
             }
+
             public function exec(string $statement): int|false
             {
                 if ($statement === 'INSERT INTO tickets DEFAULT VALUES') {
                     $this->state->inserts++;
                 }
+
                 return parent::exec($statement);
             }
+
             public function commit(): bool
             {
                 if ($this->state->throwCommit) {
                     parent::commit();
                     throw new RuntimeException('unknown commit');
                 }
+
                 return parent::commit();
             }
         };
@@ -187,10 +241,11 @@ it('does not replay admission after an unknown commit and reopens only on a late
 
 it('retries only the active commit after numeric sqlite busy', function () {
     $state = (object) ['active' => false, 'begins' => 0, 'inserts' => 0, 'commits' => 0];
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
 
         public function exec(string $statement): int|false
@@ -208,7 +263,7 @@ it('retries only the active commit after numeric sqlite busy', function () {
         public function commit(): bool
         {
             if ($this->state->active && ++$this->state->commits === 1) {
-                $exception = new \PDOException('busy commit');
+                $exception = new PDOException('busy commit');
                 $exception->errorInfo = ['HY000', 5, 'ignored'];
                 throw $exception;
             }
@@ -232,29 +287,136 @@ it('retries only the active commit after numeric sqlite busy', function () {
         ->and($database->readHead())->toBe(1);
 });
 
+it('does not retry a locked or unknown commit outcome', function (?int $sqliteCode, string $message) {
+    $failure = $sqliteCode === null ? new RuntimeException($message) : new PDOException($message);
+    if ($failure instanceof PDOException) {
+        $failure->errorInfo = ['HY000', $sqliteCode, 'ignored'];
+    }
+    $state = (object) ['active' => false, 'begins' => 0, 'inserts' => 0, 'commits' => 0];
+    $factory = static fn (string $path): PDO => new class($path, $state, $failure) extends PDO
+    {
+        public function __construct(string $path, private object $state, private Throwable $failure)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function exec(string $statement): int|false
+        {
+            if ($this->state->active && $statement === 'BEGIN EXCLUSIVE') {
+                $this->state->begins++;
+            }
+            if ($this->state->active && $statement === 'INSERT INTO tickets DEFAULT VALUES') {
+                $this->state->inserts++;
+            }
+
+            return parent::exec($statement);
+        }
+
+        public function commit(): bool
+        {
+            if ($this->state->active) {
+                $this->state->commits++;
+                throw $this->failure;
+            }
+
+            return parent::commit();
+        }
+    };
+    $database = new LockDatabase(
+        $GLOBALS['sqliteFairTestRunDirectory'].'/terminal-commit-'.$failure->getMessage(),
+        new PollingWaiter(),
+        static fn (): float => hrtime(true) / 1e9,
+        $factory,
+    );
+    $database->open();
+    $state->active = true;
+
+    expect(fn () => $database->admit())->toThrow($failure::class, $failure->getMessage())
+        ->and($state->begins)->toBe(1)
+        ->and($state->inserts)->toBe(1)
+        ->and($state->commits)->toBe(1);
+})->with([
+    'sqlite locked' => [6, 'locked'],
+    'unknown runtime outcome' => [null, 'unknown'],
+]);
+
+it('rolls back an active busy commit when its absolute deadline expires', function () {
+    $state = (object) ['active' => false, 'commits' => 0, 'rollbacks' => 0];
+    $clock = static fn (): float => $state->active && $state->commits > 0 ? 2.0 : 0.0;
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function commit(): bool
+        {
+            if ($this->state->active) {
+                $this->state->commits++;
+                $exception = new PDOException('busy until deadline');
+                $exception->errorInfo = ['HY000', 5, 'ignored'];
+                throw $exception;
+            }
+
+            return parent::commit();
+        }
+
+        public function rollBack(): bool
+        {
+            if ($this->state->active) {
+                $this->state->rollbacks++;
+            }
+
+            return parent::rollBack();
+        }
+    };
+    $database = new LockDatabase(
+        $GLOBALS['sqliteFairTestRunDirectory'].'/busy-commit-deadline',
+        new PollingWaiter(),
+        $clock,
+        $factory,
+    );
+    $database->open();
+    $state->active = true;
+
+    expect(fn () => $database->admit(1.0))->toThrow(FairWaitTimeoutException::class, 'deadline')
+        ->and($state->commits)->toBe(1)
+        ->and($state->rollbacks)->toBe(1);
+    $state->active = false;
+    expect($database->readHead())->toBeNull()
+        ->and($database->admit())->toBe(1);
+});
+
 it('does not replay exact delete units after an unknown commit', function (string $unit) {
     $state = (object) ['factory' => 0, 'throwCommit' => false, 'deletes' => 0];
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/'.$unit.'-commit-unknown';
-    $factory = static function (string $path) use ($state): \PDO {
+    $factory = static function (string $path) use ($state): PDO {
         $state->factory++;
-        return new class($path, $state) extends \PDO {
+
+        return new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION, \PDO::ATTR_STRINGIFY_FETCHES => false]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES => false]);
             }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
                 if (str_starts_with($query, 'DELETE FROM tickets')) {
                     $this->state->deletes++;
                 }
+
                 return parent::prepare($query, $options);
             }
+
             public function commit(): bool
             {
                 if ($this->state->throwCommit) {
                     parent::commit();
                     throw new RuntimeException('unknown delete commit');
                 }
+
                 return parent::commit();
             }
         };
@@ -277,28 +439,44 @@ it('does not replay exact delete units after an unknown commit', function (strin
 it('retries a numeric busy or locked head read only after arm and drain', function (int $code) {
     $state = (object) ['throwHead' => false, 'headCalls' => 0];
     $wait = (object) ['events' => []];
-    $waiter = new class($wait) implements Waiter {
+    $waiter = new class($wait) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
-        public function drain(): void { $this->state->events[] = 'drain'; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = 'block'; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
+        public function drain(): void
+        {
+            $this->state->events[] = 'drain';
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = 'block';
+        }
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/head-busy-'.$code,
         $waiter,
         static fn (): float => 0.0,
-        static fn (string $path): \PDO => new class($path, $state, $code) extends \PDO {
+        static fn (string $path): PDO => new class($path, $state, $code) extends PDO
+        {
             public function __construct(string $path, private object $state, private int $code)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
-            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+
+            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
             {
                 if ($this->state->throwHead && str_starts_with($query, 'SELECT ticket') && ++$this->state->headCalls === 1) {
-                    $exception = new \PDOException('numeric contention');
+                    $exception = new PDOException('numeric contention');
                     $exception->errorInfo = ['HY000', $this->code, 'ignored'];
                     throw $exception;
                 }
+
                 return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
             }
         },
@@ -314,7 +492,7 @@ it('retries a numeric busy or locked head read only after arm and drain', functi
 it('rejects invalid ticket columns without changing the schema', function () {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/invalid-columns';
     mkdir($directory, 0775, true);
-    $pdo = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE tickets (wrong INTEGER PRIMARY KEY AUTOINCREMENT)');
@@ -328,7 +506,7 @@ it('rejects invalid ticket columns without changing the schema', function () {
 it('rejects a ticket primary key without autoincrement without changing it', function () {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/invalid-autoincrement';
     mkdir($directory, 0775, true);
-    $pdo = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY)');
@@ -342,19 +520,23 @@ it('rejects a ticket primary key without autoincrement without changing it', fun
 
 it('fails setup immediately for a non-busy error and invalidates the handle', function () {
     $state = (object) ['factory' => 0, 'calls' => 0];
-    $factory = static function (string $path) use ($state): \PDO {
+    $factory = static function (string $path) use ($state): PDO {
         $state->factory++;
-        return new class($path, $state) extends \PDO {
+
+        return new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
+
             public function exec(string $statement): int|false
             {
                 $this->state->calls++;
                 if ($statement === 'PRAGMA busy_timeout=0') {
                     throw new RuntimeException('permanent setup failure');
                 }
+
                 return parent::exec($statement);
             }
         };
@@ -369,16 +551,20 @@ it('fails setup immediately for a non-busy error and invalidates the handle', fu
 it('stops a busy setup retry at the supplied absolute deadline', function () {
     $state = (object) ['calls' => 0];
     $now = -1.0;
-    $clock = static function () use (&$now): float { return ++$now; };
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+    $clock = static function () use (&$now): float {
+        return ++$now;
+    };
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             $this->state->calls++;
-            $exception = new \PDOException('busy setup');
+            $exception = new PDOException('busy setup');
             $exception->errorInfo = ['HY000', 5, 'ignored'];
             throw $exception;
         }
@@ -391,24 +577,40 @@ it('stops a busy setup retry at the supplied absolute deadline', function () {
 
 it('retries numeric setup contention after arming and draining', function (int $code) {
     $state = (object) ['calls' => 0, 'events' => []];
-    $waiter = new class($state) implements Waiter {
+    $waiter = new class($state) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
-        public function drain(): void { $this->state->events[] = 'drain'; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = 'block'; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
+        public function drain(): void
+        {
+            $this->state->events[] = 'drain';
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = 'block';
+        }
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state, $code) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state, $code) extends PDO
+    {
         public function __construct(string $path, private object $state, private int $code)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             if ($statement === 'PRAGMA busy_timeout=0' && ++$this->state->calls === 1) {
-                $exception = new \PDOException('numeric setup contention');
+                $exception = new PDOException('numeric setup contention');
                 $exception->errorInfo = ['HY000', $this->code, 'ignored'];
                 throw $exception;
             }
+
             return parent::exec($statement);
         }
     };
@@ -421,33 +623,51 @@ it('retries numeric setup contention after arming and draining', function (int $
 
 it('rolls back and retries a busy statement inside each mutation unit', function (string $unit) {
     $state = (object) ['unit' => null, 'attempts' => 0, 'events' => []];
-    $waiter = new class($state) implements Waiter {
+    $waiter = new class($state) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
-        public function drain(): void { $this->state->events[] = 'drain'; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = 'block'; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
+        public function drain(): void
+        {
+            $this->state->events[] = 'drain';
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = 'block';
+        }
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             if ($this->state->unit === 'admission' && $statement === 'INSERT INTO tickets DEFAULT VALUES' && ++$this->state->attempts === 1) {
-                $exception = new \PDOException('busy admission');
+                $exception = new PDOException('busy admission');
                 $exception->errorInfo = ['HY000', 5, 'ignored'];
                 throw $exception;
             }
+
             return parent::exec($statement);
         }
-        public function prepare(string $query, array $options = []): \PDOStatement|false
+
+        public function prepare(string $query, array $options = []): PDOStatement|false
         {
             if (in_array($this->state->unit, ['foreign', 'normal'], true) && str_starts_with($query, 'DELETE FROM tickets') && ++$this->state->attempts === 1) {
-                $exception = new \PDOException('busy delete');
+                $exception = new PDOException('busy delete');
                 $exception->errorInfo = ['HY000', 6, 'ignored'];
                 throw $exception;
             }
+
             return parent::prepare($query, $options);
         }
     };
@@ -467,33 +687,41 @@ it('rolls back and retries a busy statement inside each mutation unit', function
 
 it('keeps the statement error primary and invalidates after rollback failure', function (string $unit) {
     $state = (object) ['unit' => null, 'factory' => 0, 'rollback' => 0];
-    $factory = static function (string $path) use ($state): \PDO {
+    $factory = static function (string $path) use ($state): PDO {
         $state->factory++;
-        return new class($path, $state) extends \PDO {
+
+        return new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
+
             public function exec(string $statement): int|false
             {
                 if ($this->state->unit === 'admission' && $statement === 'INSERT INTO tickets DEFAULT VALUES') {
                     throw new RuntimeException('primary admission statement');
                 }
+
                 return parent::exec($statement);
             }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
                 if (in_array($this->state->unit, ['foreign', 'normal'], true) && str_starts_with($query, 'DELETE FROM tickets')) {
                     throw new RuntimeException('primary delete statement');
                 }
+
                 return parent::prepare($query, $options);
             }
+
             public function rollBack(): bool
             {
                 if ($this->state->unit !== null) {
                     $this->state->rollback++;
                     throw new RuntimeException('secondary rollback');
                 }
+
                 return parent::rollBack();
             }
         };
@@ -517,23 +745,29 @@ it('keeps the statement error primary and invalidates after rollback failure', f
 
 it('retries numeric contention before begin for every mutation unit', function (string $unit) {
     $state = (object) ['unit' => $unit === 'bootstrap' ? 'bootstrap' : null, 'begins' => 0];
-    $waiter = new class implements Waiter {
+    $waiter = new class implements Waiter
+    {
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
-            if ($statement === 'BEGIN IMMEDIATE' && $this->state->unit !== null && ++$this->state->begins === 1) {
-                $exception = new \PDOException('busy before begin');
+            if ($statement === 'BEGIN EXCLUSIVE' && $this->state->unit !== null && ++$this->state->begins === 1) {
+                $exception = new PDOException('busy before begin');
                 $exception->errorInfo = ['HY000', 5, 'ignored'];
                 throw $exception;
             }
+
             return parent::exec($statement);
         }
     };
@@ -555,21 +789,40 @@ it('retries numeric contention before begin for every mutation unit', function (
 
 it('blocks only after the immediate second begin statecheck is still busy', function () {
     $state = (object) ['begins' => 0, 'events' => []];
-    $waiter = new class($state) implements Waiter {
+    $waiter = new class($state) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
-        public function drain(): void { $this->state->events[] = 'drain'; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = 'block'; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
+        public function drain(): void
+        {
+            $this->state->events[] = 'drain';
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = 'block';
+        }
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
-            if ($statement === 'BEGIN IMMEDIATE' && ++$this->state->begins <= 2) {
-                $exception = new \PDOException('busy begin');
+            if ($statement === 'BEGIN EXCLUSIVE' && ++$this->state->begins <= 2) {
+                $exception = new PDOException('busy begin');
                 $exception->errorInfo = ['HY000', 5, 'ignored'];
                 throw $exception;
             }
+
             return parent::exec($statement);
         }
     };
@@ -582,28 +835,44 @@ it('blocks only after the immediate second begin statecheck is still busy', func
 
 it('makes exactly one cleanup statement attempt for busy and permanent failures', function (bool $busy) {
     $state = (object) ['fail' => false, 'prepares' => 0, 'waits' => 0];
-    $waiter = new class($state) implements Waiter {
+    $waiter = new class($state) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->waits++; }
-        public function drain(): void { $this->state->waits++; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->waits++; }
+
+        public function arm(): void
+        {
+            $this->state->waits++;
+        }
+
+        public function drain(): void
+        {
+            $this->state->waits++;
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->waits++;
+        }
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state, $busy) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state, $busy) extends PDO
+    {
         public function __construct(string $path, private object $state, private bool $busy)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
-        public function prepare(string $query, array $options = []): \PDOStatement|false
+
+        public function prepare(string $query, array $options = []): PDOStatement|false
         {
             if ($this->state->fail && str_starts_with($query, 'DELETE FROM tickets')) {
                 $this->state->prepares++;
                 if ($this->busy) {
-                    $exception = new \PDOException('busy cleanup');
+                    $exception = new PDOException('busy cleanup');
                     $exception->errorInfo = ['HY000', 5, 'ignored'];
                     throw $exception;
                 }
                 throw new RuntimeException('permanent cleanup');
             }
+
             return parent::prepare($query, $options);
         }
     };
@@ -611,7 +880,7 @@ it('makes exactly one cleanup statement attempt for busy and permanent failures'
     $ticket = $database->admit();
     $state->fail = true;
 
-    expect(fn () => $database->cleanupExact($ticket))->toThrow($busy ? \PDOException::class : RuntimeException::class)
+    expect(fn () => $database->cleanupExact($ticket))->toThrow($busy ? PDOException::class : RuntimeException::class)
         ->and($state->prepares)->toBe(1)
         ->and($state->waits)->toBe(0);
 })->with([true, false]);
@@ -619,23 +888,30 @@ it('makes exactly one cleanup statement attempt for busy and permanent failures'
 it('handles busy deadline and permanent failures during final validation', function (string $mode) {
     $state = (object) ['final' => false, 'throws' => 0, 'reads' => 0];
     $clock = static fn (): float => $mode === 'deadline' && $state->throws > 0 ? 2.0 : 0.0;
-    $waiter = new class implements Waiter {
+    $waiter = new class implements Waiter
+    {
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state, $mode) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state, $mode) extends PDO
+    {
         public function __construct(string $path, private object $state, private string $mode)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function commit(): bool
         {
             $result = parent::commit();
             $this->state->final = true;
+
             return $result;
         }
-        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
         {
             if ($this->state->final && $query === 'PRAGMA busy_timeout') {
                 $this->state->reads++;
@@ -643,11 +919,12 @@ it('handles busy deadline and permanent failures during final validation', funct
                     if ($this->mode === 'permanent') {
                         throw new RuntimeException('permanent final validation');
                     }
-                    $exception = new \PDOException('busy final validation');
+                    $exception = new PDOException('busy final validation');
                     $exception->errorInfo = ['HY000', 5, 'ignored'];
                     throw $exception;
                 }
             }
+
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
@@ -667,21 +944,40 @@ it('handles busy deadline and permanent failures during final validation', funct
 
 it('retries only the active idempotent setup statement for numeric contention', function (string $statement, int $code) {
     $state = (object) ['calls' => 0, 'events' => []];
-    $waiter = new class($state) implements Waiter {
+    $waiter = new class($state) implements Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
-        public function drain(): void { $this->state->events[] = 'drain'; }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = ['block', $deadline]; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
+        public function drain(): void
+        {
+            $this->state->events[] = 'drain';
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = ['block', $deadline];
+        }
     };
-    $factory = static fn (string $path): \PDO => new class($path, $state, $statement, $code) extends \PDO {
-        public function __construct(string $path, private object $state, private string $target, private int $code) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $factory = static fn (string $path): PDO => new class($path, $state, $statement, $code) extends PDO
+    {
+        public function __construct(string $path, private object $state, private string $target, private int $code)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
             if ($statement === $this->target && ++$this->state->calls === 1) {
-                $exception = new \PDOException('setup contention');
+                $exception = new PDOException('setup contention');
                 $exception->errorInfo = ['HY000', $this->code, 'ignored'];
                 throw $exception;
             }
+
             return parent::exec($statement);
         }
     };
@@ -699,11 +995,20 @@ it('retries only the active idempotent setup statement for numeric contention', 
 
 it('does not retry permanent setup statement failures', function (string $statement) {
     $state = (object) ['calls' => 0];
-    $factory = static fn (string $path): \PDO => new class($path, $state, $statement) extends \PDO {
-        public function __construct(string $path, private object $state, private string $target) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $factory = static fn (string $path): PDO => new class($path, $state, $statement) extends PDO
+    {
+        public function __construct(string $path, private object $state, private string $target)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
-            if ($statement === $this->target) { $this->state->calls++; throw new RuntimeException('permanent setup unit'); }
+            if ($statement === $this->target) {
+                $this->state->calls++;
+                throw new RuntimeException('permanent setup unit');
+            }
+
             return parent::exec($statement);
         }
     };
@@ -716,17 +1021,25 @@ it('does not retry permanent setup statement failures', function (string $statem
 it('rejects invalid final pragma readbacks without replacing the schema', function (string $pragma, string $wrongSelect) {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/invalid-final-'.str_replace('_', '-', $pragma);
     mkdir($directory, 0775, true);
-    $seed = new \PDO('sqlite:'.$directory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $seed = new PDO('sqlite:'.$directory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $seed->exec('PRAGMA journal_mode=DELETE');
     $seed->exec('PRAGMA synchronous=NORMAL');
     $seed->exec('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY AUTOINCREMENT)');
     $seed->exec('PRAGMA user_version=1');
     $state = (object) ['reads' => 0];
-    $factory = static fn (string $path): \PDO => new class($path, $state, $pragma, $wrongSelect) extends \PDO {
-        public function __construct(string $path, private object $state, private string $pragma, private string $wrongSelect) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    $factory = static fn (string $path): PDO => new class($path, $state, $pragma, $wrongSelect) extends PDO
+    {
+        public function __construct(string $path, private object $state, private string $pragma, private string $wrongSelect)
         {
-            if ($query === 'PRAGMA '.$this->pragma && ++$this->state->reads === 2) { return parent::query($this->wrongSelect); }
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
+        {
+            if ($query === 'PRAGMA '.$this->pragma && ++$this->state->reads === 2) {
+                return parent::query($this->wrongSelect);
+            }
+
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
@@ -749,17 +1062,26 @@ it('rejects a corrupt lock database without replacing its bytes', function () {
     $before = hash_file('sha256', $path);
     $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
 
-    expect(fn () => $database->open())->toThrow(\PDOException::class)
+    expect(fn () => $database->open())->toThrow(PDOException::class)
         ->and(hash_file('sha256', $path))->toBe($before);
 });
 
 it('does not retry a permanent head-read failure', function () {
     $state = (object) ['fail' => false, 'reads' => 0];
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
         {
-            if ($this->state->fail && str_starts_with($query, 'SELECT ticket')) { $this->state->reads++; throw new RuntimeException('permanent head read'); }
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
+        {
+            if ($this->state->fail && str_starts_with($query, 'SELECT ticket')) {
+                $this->state->reads++;
+                throw new RuntimeException('permanent head read');
+            }
+
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
@@ -773,12 +1095,25 @@ it('does not retry a permanent head-read failure', function () {
 it('stops a busy head read before its second statecheck at the absolute deadline', function () {
     $state = (object) ['fail' => false, 'reads' => 0];
     $now = -1.0;
-    $clock = static function () use (&$now): float { return ++$now; };
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    $clock = static function () use (&$now): float {
+        return ++$now;
+    };
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
         {
-            if ($this->state->fail && str_starts_with($query, 'SELECT ticket')) { $this->state->reads++; $e = new \PDOException('busy head'); $e->errorInfo = ['HY000', 5, 'ignored']; throw $e; }
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
+        {
+            if ($this->state->fail && str_starts_with($query, 'SELECT ticket')) {
+                $this->state->reads++;
+                $e = new PDOException('busy head');
+                $e->errorInfo = ['HY000', 5, 'ignored'];
+                throw $e;
+            }
+
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
@@ -793,16 +1128,34 @@ it('stops a busy head read before its second statecheck at the absolute deadline
 it('stops exact delete begin and statement retries at the same absolute deadline', function (string $point) {
     $state = (object) ['active' => false, 'attempts' => 0];
     $clock = static fn (): float => $state->attempts > 0 ? 2.0 : 0.0;
-    $factory = static fn (string $path): \PDO => new class($path, $state, $point) extends \PDO {
-        public function __construct(string $path, private object $state, private string $point) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $factory = static fn (string $path): PDO => new class($path, $state, $point) extends PDO
+    {
+        public function __construct(string $path, private object $state, private string $point)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
-            if ($this->state->active && $this->point === 'begin' && $statement === 'BEGIN IMMEDIATE') { $this->state->attempts++; $e = new \PDOException('busy delete begin'); $e->errorInfo = ['HY000', 5, 'ignored']; throw $e; }
+            if ($this->state->active && $this->point === 'begin' && $statement === 'BEGIN EXCLUSIVE') {
+                $this->state->attempts++;
+                $e = new PDOException('busy delete begin');
+                $e->errorInfo = ['HY000', 5, 'ignored'];
+                throw $e;
+            }
+
             return parent::exec($statement);
         }
-        public function prepare(string $query, array $options = []): \PDOStatement|false
+
+        public function prepare(string $query, array $options = []): PDOStatement|false
         {
-            if ($this->state->active && $this->point === 'statement' && str_starts_with($query, 'DELETE FROM tickets')) { $this->state->attempts++; $e = new \PDOException('busy delete statement'); $e->errorInfo = ['HY000', 6, 'ignored']; throw $e; }
+            if ($this->state->active && $this->point === 'statement' && str_starts_with($query, 'DELETE FROM tickets')) {
+                $this->state->attempts++;
+                $e = new PDOException('busy delete statement');
+                $e->errorInfo = ['HY000', 6, 'ignored'];
+                throw $e;
+            }
+
             return parent::prepare($query, $options);
         }
     };
@@ -815,25 +1168,32 @@ it('stops exact delete begin and statement retries at the same absolute deadline
 })->with(['begin', 'statement']);
 
 it('handles bootstrap statement rollback and commit outcomes without unsafe replay', function (string $mode) {
+    Log::spy();
     $state = (object) ['mode' => $mode, 'creates' => 0, 'rollbacks' => 0, 'factory' => 0];
-    $waiter = new class implements Waiter {
+    $waiter = new class implements Waiter
+    {
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
-    $factory = static function (string $path) use ($state): \PDO {
+    $factory = static function (string $path) use ($state): PDO {
         $state->factory++;
-        return new class($path, $state) extends \PDO {
+
+        return new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
+
             public function exec(string $statement): int|false
             {
                 if (str_starts_with($statement, 'CREATE TABLE tickets')) {
                     $this->state->creates++;
                     if ($this->state->mode === 'busy' && $this->state->creates === 1) {
-                        $exception = new \PDOException('busy bootstrap statement');
+                        $exception = new PDOException('busy bootstrap statement');
                         $exception->errorInfo = ['HY000', 5, 'ignored'];
                         throw $exception;
                     }
@@ -841,37 +1201,50 @@ it('handles bootstrap statement rollback and commit outcomes without unsafe repl
                         throw new RuntimeException('primary bootstrap statement');
                     }
                 }
+
                 return parent::exec($statement);
             }
+
             public function rollBack(): bool
             {
                 $this->state->rollbacks++;
                 if ($this->state->mode === 'rollback') {
                     throw new RuntimeException('secondary bootstrap rollback');
                 }
+
                 return parent::rollBack();
             }
+
             public function commit(): bool
             {
                 if ($this->state->mode === 'commit') {
                     parent::commit();
                     throw new RuntimeException('unknown bootstrap commit');
                 }
+
                 return parent::commit();
             }
         };
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/bootstrap-outcome-'.$mode, $waiter, static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/bootstrap-outcome-'.$mode, $waiter, static fn (): float => 0.0, $factory, true);
 
     if ($mode === 'busy') {
         $database->open();
         expect($state->creates)->toBe(2)->and($state->rollbacks)->toBe(1);
+
         return;
     }
     $message = $mode === 'commit' ? 'unknown bootstrap commit' : 'primary bootstrap statement';
     expect(fn () => $database->open())->toThrow(RuntimeException::class, $message)
         ->and($state->creates)->toBe(1)
         ->and($state->factory)->toBe(1);
+    if ($mode === 'commit') {
+        Log::shouldNotHaveReceived(
+            'debug',
+            static fn (string $logMessage, array $context): bool => $logMessage === 'Fair SQLite transition.'
+                && ($context['event'] ?? null) === 'lock_database_bootstrap',
+        );
+    }
     $state->mode = 'none';
     $database->open();
     expect($state->factory)->toBe(2);
@@ -879,25 +1252,30 @@ it('handles bootstrap statement rollback and commit outcomes without unsafe repl
 
 it('does not retry permanent statement errors after successful rollback', function (string $unit) {
     $state = (object) ['unit' => null, 'attempts' => 0];
-    $factory = static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+    $factory = static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             if ($this->state->unit === 'admission' && $statement === 'INSERT INTO tickets DEFAULT VALUES') {
                 $this->state->attempts++;
                 throw new RuntimeException('permanent admission statement');
             }
+
             return parent::exec($statement);
         }
-        public function prepare(string $query, array $options = []): \PDOStatement|false
+
+        public function prepare(string $query, array $options = []): PDOStatement|false
         {
             if (in_array($this->state->unit, ['foreign', 'normal'], true) && str_starts_with($query, 'DELETE FROM tickets')) {
                 $this->state->attempts++;
                 throw new RuntimeException('permanent delete statement');
             }
+
             return parent::prepare($query, $options);
         }
     };

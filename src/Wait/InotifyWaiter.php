@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * Uses Linux directory events as bounded wake hints for lock-state checks.
@@ -40,11 +42,12 @@ final class InotifyWaiter implements Waiter
      * @param  string  $directory  Existing absolute lock directory to observe.
      * @param  bool  $allowPostArmPolling  Whether a later native failure may switch this adapter to polling.
      * @param  null|callable(array<int, resource>&, array<int, resource>&, array<int, resource>&, int, int): (int|false)  $select  Internal stream-select seam.
-     * @return void
+     * @param  bool  $debug  Whether post-arm degradation emits a structured debug log.
+     * @return void The adapter owns an armed Inotify stream and directory watch.
      *
      * @throws RuntimeException When Inotify is unavailable or the initial watch cannot be armed.
      */
-    public function __construct(private readonly string $directory, private readonly bool $allowPostArmPolling = false, ?callable $select = null)
+    public function __construct(private readonly string $directory, private readonly bool $allowPostArmPolling = false, ?callable $select = null, private readonly bool $debug = false)
     {
         if (! function_exists('inotify_init')) {
             throw new RuntimeException('The inotify extension is required for native Linux waiting.');
@@ -59,7 +62,7 @@ final class InotifyWaiter implements Waiter
     /**
      * Removes the directory watch and closes the owned Inotify stream.
      *
-     * @return void
+     * @return void The owned watch and stream have been released best-effort.
      */
     public function __destruct()
     {
@@ -76,7 +79,7 @@ final class InotifyWaiter implements Waiter
      * SQLite's DELETE-journal lifecycle. A post-arm failure degrades auto mode;
      * startup and native-mode failures remain fatal.
      *
-     * @return void
+     * @return void The native watch is armed, or the permitted polling fallback is active.
      *
      * @throws RuntimeException When the watch cannot be registered and degradation is not allowed.
      */
@@ -92,6 +95,7 @@ final class InotifyWaiter implements Waiter
         if ($watch === false) {
             if ($this->allowPostArmPolling && $this->armedOnce) {
                 $this->degraded = true;
+                $this->debugDegradation('arm');
 
                 return;
             }
@@ -107,7 +111,7 @@ final class InotifyWaiter implements Waiter
      * The stream is nonblocking, so this method only clears already available
      * hints. Degraded adapters have no native events to consume.
      *
-     * @return void
+     * @return void Every currently buffered Inotify event has been consumed.
      */
     public function drain(): void
     {
@@ -126,7 +130,7 @@ final class InotifyWaiter implements Waiter
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
-     * @return void
+     * @return void The event, bounded interval, or supplied deadline ended the wait.
      *
      * @throws RuntimeException When stream selection fails and degradation is not allowed.
      */
@@ -150,7 +154,20 @@ final class InotifyWaiter implements Waiter
                 throw new RuntimeException('The inotify wait failed after the watch was armed.');
             }
             $this->degraded = true;
+            $this->debugDegradation('block');
             ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
+        }
+    }
+
+    /** Emit the single diagnostic allowed for automatic native degradation. */
+    private function debugDegradation(string $operation): void
+    {
+        if ($this->debug) {
+            try {
+                Log::debug('Fair SQLite transition.', ['event' => 'waiter_degraded', 'pid' => getmypid(), 'adapter' => 'inotify', 'operation' => $operation, 'fallback' => 'polling']);
+            } catch (Throwable) {
+                // Optional diagnostics must never change waiter degradation.
+            }
         }
     }
 }

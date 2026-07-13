@@ -22,6 +22,7 @@ beforeEach(function (): void {
         'lock_directory' => $this->lockDirectory,
         'stale_head_seconds' => 10.0,
         'wait_strategy' => 'polling',
+        'debug' => false,
     ]);
 });
 
@@ -35,6 +36,7 @@ test('manually isolated provider runtime registers the fair sqlite driver', func
         'lock_directory' => $this->lockDirectory,
         'wait_strategy' => 'polling',
         'stale_head_seconds' => 10.0,
+        'debug' => false,
     ]);
 
     $connection = app('db')->connection('package');
@@ -43,6 +45,15 @@ test('manually isolated provider runtime registers the fair sqlite driver', func
         ->toBeInstanceOf(FairSQLiteConnection::class)
         ->and($connection->getName())->toBe('package')
         ->and($connection->getConfig('driver'))->toBe('fair-sqlite');
+});
+
+test('provider publishes exactly the package configuration with its dedicated tag', function (): void {
+    $this->app->register(FairSQLiteServiceProvider::class);
+
+    expect(FairSQLiteServiceProvider::pathsToPublish(FairSQLiteServiceProvider::class, 'sqlite-fair-config'))
+        ->toBe([
+            dirname(__DIR__, 2).'/config/sqlite-fair.php' => config_path('sqlite-fair.php'),
+        ]);
 });
 
 test('platform path decisions cover posix wsl windows drives and unc without coercion', function (string $platform, string $path, bool $expected): void {
@@ -97,15 +108,17 @@ test('file connections merge overrides and preserve upstream pdo options', funct
         'lock_directory' => $this->lockDirectory,
         'stale_head_seconds' => 2,
         'wait_strategy' => 'polling',
-        'options' => [\PDO::ATTR_TIMEOUT => 7],
+        'debug' => true,
+        'options' => [PDO::ATTR_TIMEOUT => 7],
     ], 'file');
 
     expect($connection)
         ->toBeInstanceOf(FairSQLiteConnection::class)
         ->and($connection->getName())->toBe('file')
         ->and($connection->getConfig('stale_head_seconds'))->toBe(2)
+        ->and($connection->getConfig('debug'))->toBeTrue()
         ->and($connection->getTablePrefix())->toBe('p_')
-        ->and($connection->getConfig('options'))->toBe([\PDO::ATTR_TIMEOUT => 7]);
+        ->and($connection->getConfig('options'))->toBe([PDO::ATTR_TIMEOUT => 7]);
 });
 
 test('file connections reject invalid fair configuration without coercion', function (string $key, mixed $value): void {
@@ -115,6 +128,7 @@ test('file connections reject invalid fair configuration without coercion', func
         'lock_directory' => $this->lockDirectory,
         'stale_head_seconds' => 10.0,
         'wait_strategy' => 'polling',
+        'debug' => false,
         $key => $value,
     ], 'invalid-'.str_replace('.', '-', uniqid('', true)));
 })->with([
@@ -127,6 +141,9 @@ test('file connections reject invalid fair configuration without coercion', func
     'infinite stale seconds' => ['stale_head_seconds', INF],
     'unknown strategy' => ['wait_strategy', 'fallback'],
     'null strategy' => ['wait_strategy', null],
+    'string debug' => ['debug', 'false'],
+    'integer debug' => ['debug', 0],
+    'null debug' => ['debug', null],
 ])->throws(FairSQLiteException::class);
 
 test('file connections reject relative and drive-relative database paths', function (string $database): void {
@@ -136,6 +153,7 @@ test('file connections reject relative and drive-relative database paths', funct
         'lock_directory' => $this->lockDirectory,
         'stale_head_seconds' => 10.0,
         'wait_strategy' => 'polling',
+        'debug' => false,
     ], 'relative-'.str_replace('.', '-', uniqid('', true)));
 })->with([
     'relative' => 'database/app.sqlite',

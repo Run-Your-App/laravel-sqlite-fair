@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
+use RuntimeException;
+
 /**
  * Coordinates a bounded wake hint between complete lock-state checks.
  *
@@ -23,9 +25,9 @@ interface Waiter
      * error unless the adapter has already armed successfully and its auto mode
      * explicitly permits degradation.
      *
-     * @return void
+     * @return void The adapter is ready for the caller's immediate second state check.
      *
-     * @throws \RuntimeException When the adapter cannot arm its wait boundary.
+     * @throws RuntimeException When the adapter cannot arm its wait boundary.
      */
     public function arm(): void;
 
@@ -35,9 +37,9 @@ interface Waiter
      * The lock owner calls this immediately after arm() so buffered events cannot
      * create a lost-wakeup window between native registration and state recheck.
      *
-     * @return void
+     * @return void Every wake hint already buffered by the adapter has been consumed.
      *
-     * @throws \RuntimeException When buffered native events cannot be consumed.
+     * @throws RuntimeException When buffered native events cannot be consumed.
      */
     public function drain(): void;
 
@@ -50,9 +52,9 @@ interface Waiter
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
-     * @return void
+     * @return void The bounded wait ended; callers must perform a complete state check.
      *
-     * @throws \RuntimeException When the selected wait operation cannot complete.
+     * @throws RuntimeException When the selected wait operation cannot complete.
      */
     public function block(?float $deadline, callable $monotonic): void;
 }

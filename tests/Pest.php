@@ -9,8 +9,8 @@ uses(
 
 function testRunDirectoryName(): string
 {
-    $now = \DateTimeImmutable::createFromFormat('U.u', sprintf('%.6F', microtime(true)));
-    if (! $now instanceof \DateTimeImmutable) {
+    $now = DateTimeImmutable::createFromFormat('U.u', sprintf('%.6F', microtime(true)));
+    if (! $now instanceof DateTimeImmutable) {
         throw new RuntimeException('The package test run timestamp could not be created.');
     }
 

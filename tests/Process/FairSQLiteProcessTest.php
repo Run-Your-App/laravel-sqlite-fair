@@ -28,6 +28,26 @@ it('boots concurrent children only through the package autoloader and fixed work
     });
 });
 
+it('waits before a ticket mutation while another process holds a lock database read transaction', function () {
+    $harness = new ProcessHarness();
+    $harness->run(function (string $workspace) use ($harness): void {
+        $database = new LockDatabase(
+            $workspace.'/locks',
+            new PollingWaiter(),
+            static fn (): float => hrtime(true) / 1e9,
+        );
+        expect($database->admit())->toBe(1);
+
+        $results = $harness->runChildren([
+            ['scenario' => 'lock-reader'],
+            ['scenario' => 'ticket-mutator'],
+        ]);
+
+        expect(array_column($results, 'exit_code'))->toBe([0, 0], implode(PHP_EOL, array_column($results, 'stderr')))
+            ->and($database->readHead())->toBeNull();
+    });
+});
+
 it('keeps concurrent writers mutually exclusive and makes progress without notification events', function () {
     $harness = new ProcessHarness();
     $harness->run(function (string $workspace) use ($harness): void {

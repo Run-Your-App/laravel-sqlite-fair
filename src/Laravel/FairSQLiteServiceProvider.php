@@ -23,11 +23,11 @@ final class FairSQLiteServiceProvider extends ServiceProvider
      * An already-resolved database manager is extended immediately. Otherwise the factory is attached when Laravel
      * first resolves that manager, so both boot orders create connections through `FairSQLiteConnector`.
      *
-     * @return void
+     * @return void The provider registration is applied directly to Laravel's container.
      */
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__.'/../../config/sqlite-fair.php', 'sqlite-fair');
+        $this->mergeConfigFrom(dirname(__DIR__, 2).'/config/sqlite-fair.php', 'sqlite-fair');
 
         $register = static function (DatabaseManager $databaseManager): void {
             $databaseManager->extend(
@@ -43,5 +43,20 @@ final class FairSQLiteServiceProvider extends ServiceProvider
         }
 
         $this->app->resolving('db', $register);
+    }
+
+    /**
+     * Makes the package configuration available to Laravel applications.
+     *
+     * Applications may publish the documented package defaults to `config/sqlite-fair.php` with the
+     * `sqlite-fair-config` tag and then keep their deployment-specific lock directory and diagnostics setting there.
+     *
+     * @return void The publish mapping is registered directly with Laravel.
+     */
+    public function boot(): void
+    {
+        $this->publishes([
+            dirname(__DIR__, 2).'/config/sqlite-fair.php' => $this->app->configPath('sqlite-fair.php'),
+        ], 'sqlite-fair-config');
     }
 }

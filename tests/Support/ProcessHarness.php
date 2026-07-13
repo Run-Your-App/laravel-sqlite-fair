@@ -47,7 +47,7 @@ final class ProcessHarness
     /**
      * Starts all supplied child programs before collecting their output.
      *
-     * @param list<array{scenario: string, arguments?: array<string, int|string>}> $children
+     * @param  list<array{scenario: string, arguments?: array<string, int|string>}>  $specifications
      * @return list<array{exit_code: int, stdout: string, stderr: string}>
      */
     public function runChildren(array $specifications): array

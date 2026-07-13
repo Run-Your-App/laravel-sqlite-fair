@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Lock;
 
+use Illuminate\Support\Facades\Log;
 use PDO;
 use PDOStatement;
 use RuntimeException;
@@ -12,11 +13,17 @@ use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
 /**
- * Acquires the application SQLite writer fence directly until contention is seen,
- * then preserves FIFO order through the private ticket database.
+ * Owns writer-fence acquisition for one physical application PDO lifecycle.
  *
- * A successful call returns while the application `BEGIN IMMEDIATE` fence is held.
- * The caller receives `null` for direct ownership or its committed queue ticket.
+ * The connection owner calls this state machine before executing business writes.
+ * It attempts the application `BEGIN IMMEDIATE` fence directly while the ticket
+ * queue is empty, then preserves FIFO order through LockDatabase after contention.
+ * It also observes and recovers stale foreign heads only while holding the real
+ * application writer fence.
+ *
+ * A successful acquisition returns while that application fence remains held. The
+ * caller receives null for direct ownership or its committed queue ticket and is
+ * responsible for the later business commit, rollback, and ticket cleanup.
  *
  * @internal
  */
@@ -35,6 +42,23 @@ final class FairSQLiteLock
 
     private ?float $observedSinceMonotonic = null;
 
+    /**
+     * Creates the per-connection writer-acquisition state machine.
+     *
+     * @param  PDO  $appPdo  Application PDO on which the real writer fence is acquired.
+     * @param  LockDatabase  $lockDatabase  Private FIFO ticket database for this application database.
+     * @param  Waiter  $waiter  Shared native or polling wait adapter.
+     * @param  float  $staleHeadSeconds  Positive seconds before fenced stale-head revalidation.
+     * @param  callable(Throwable): void  $onUnknownAppPdoOutcome  Marks an indeterminate app-PDO outcome.
+     * @param  callable(): void  $disconnect  Retires the affected application PDO.
+     * @param  (callable(): float)|null  $monotonic  Internal deterministic monotonic clock seam.
+     * @param  bool  $debug  Whether abnormal transitions emit structured Laravel debug logs.
+     * @return void The instance is ready to coordinate the supplied application PDO.
+     *
+     * @throws RuntimeException When the stale-head threshold is not positive.
+     *
+     * @internal
+     */
     public function __construct(
         private readonly PDO $appPdo,
         private readonly LockDatabase $lockDatabase,
@@ -43,6 +67,7 @@ final class FairSQLiteLock
         callable $onUnknownAppPdoOutcome,
         callable $disconnect,
         ?callable $monotonic = null,
+        private readonly bool $debug = false,
     ) {
         if ($staleHeadSeconds <= 0.0) {
             throw new RuntimeException('SQLite fair stale-head seconds must be positive.');
@@ -52,13 +77,27 @@ final class FairSQLiteLock
         $this->disconnect = $disconnect;
     }
 
-    /** @return int|null The committed queue ticket, or null for uncontended direct ownership. */
+    /**
+     * Acquire the application writer fence using direct-first fairness.
+     *
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     * @return int|null The committed queue ticket, or null for uncontended direct ownership.
+     *
+     * @throws Throwable When acquisition, recovery, timeout, or abort cleanup fails.
+     */
     public function acquire(?float $deadline = null): ?int
     {
         return $this->acquireWithMode(false, $deadline);
     }
 
-    /** @return int The committed queue ticket. */
+    /**
+     * Acquire the application writer fence through the FIFO queue.
+     *
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     * @return int The committed queue ticket held by the caller.
+     *
+     * @throws Throwable When queued acquisition, recovery, timeout, or abort cleanup fails.
+     */
     public function acquireQueued(?float $deadline = null): int
     {
         $ticket = $this->acquireWithMode(true, $deadline);
@@ -69,6 +108,20 @@ final class FairSQLiteLock
         return $ticket;
     }
 
+    /**
+     * Runs the direct-first or forced-queued writer-acquisition state machine.
+     *
+     * Direct mode returns only after proving the queue remained empty across the
+     * application fence. Queued mode admits once, follows the committed FIFO head,
+     * requeues a reclaimed own ticket, and returns only while owning both the head
+     * ticket and application writer fence. Any failure triggers pre-business abort.
+     *
+     * @param  bool  $forceQueued  Whether to skip direct acquisition and join the queue immediately.
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     * @return int|null The committed owned ticket, or null after direct acquisition.
+     *
+     * @throws Throwable When acquisition or its pre-business abort cannot complete normally.
+     */
     private function acquireWithMode(bool $forceQueued, ?float $deadline): ?int
     {
         $clock = $this->monotonic;
@@ -145,12 +198,23 @@ final class FairSQLiteLock
         }
     }
 
-    /** Ends a held pre-business fence first, then performs one nonblocking own-ticket cleanup. */
+    /**
+     * Abort a pre-business acquisition without replaying uncertain work.
+     *
+     * Rollback and emergency ticket-cleanup failures are reported and converted to
+     * the connection's unknown-outcome handling; this boundary does not rethrow
+     * them because it is already running while another acquisition failure escapes.
+     *
+     * @param  bool  $fenceHeld  Whether this scope still owns the application writer fence.
+     * @param  int|null  $ownTicket  Committed ticket to clean once, or null for direct acquisition.
+     * @return void Rollback and owned-ticket cleanup have each been attempted at most once.
+     */
     public function abortBeforeBusiness(bool $fenceHeld, ?int $ownTicket): void
     {
         if ($fenceHeld) {
             try {
                 $this->appPdo->rollBack();
+                $this->debug('lock_rollback', ['operation' => 'pre_business_abort']);
             } catch (Throwable $rollback) {
                 $this->markUnknownOutcome($rollback);
                 report($rollback);
@@ -161,17 +225,32 @@ final class FairSQLiteLock
             try {
                 $this->cleanupOwnTicket($ownTicket);
             } catch (Throwable $cleanup) {
+                $this->debug('cleanup_failed', ['operation' => 'abort']);
                 report($cleanup);
             }
         }
     }
 
-    /** Performs the one permitted nonblocking cleanup attempt for an owned ticket. */
+    /**
+     * Perform the one permitted nonblocking cleanup for an owned ticket.
+     *
+     * @param  int  $ownTicket  Committed ticket owned by the aborting connection.
+     * @return void The cleanup attempt completed with a known outcome.
+     *
+     * @throws Throwable When the one cleanup attempt fails.
+     */
     public function cleanupOwnTicket(int $ownTicket): void
     {
         $this->lockDatabase->cleanupExact($ownTicket);
     }
 
+    /**
+     * Removes a stale foreign head only after fenced revalidation.
+     *
+     * Failure to obtain the application writer fence proves an active writer may
+     * still own the ticket, so this method waits without deleting it. After fencing,
+     * the same ticket must still be queue head before LockDatabase removes it.
+     */
     private function recoverStaleHead(int $observedHead, ?float $deadline): void
     {
         if (! $this->tryAppFence()) {
@@ -184,14 +263,17 @@ final class FairSQLiteLock
             return;
         }
 
+        $recovered = false;
         try {
             if ($this->lockDatabase->readHead($deadline) === $observedHead) {
                 $this->lockDatabase->deleteForeignHead($observedHead, $deadline);
+                $recovered = true;
             }
         } catch (Throwable $exception) {
             if ($this->appPdo->inTransaction()) {
                 try {
                     $this->appPdo->rollBack();
+                    $this->debug('lock_rollback', ['operation' => 'recovery_failure']);
                 } catch (Throwable $rollback) {
                     $this->markUnknownOutcome($rollback);
                     report($rollback);
@@ -202,15 +284,33 @@ final class FairSQLiteLock
 
         $this->rollbackFenceKnown();
         $this->resetObservation();
+        if ($recovered) {
+            $this->debug('stale_head_recovered', ['head_ticket' => $observedHead]);
+        }
     }
 
+    /**
+     * Replaces a reclaimed own ticket by joining the committed queue tail.
+     *
+     * The absent ticket is never deleted again; only the new committed ticket is
+     * returned to the acquisition state machine.
+     */
     private function requeueLostTicket(int $ticket, ?float $deadline): int
     {
         // An absent/reclaimed ticket is not deleted again; a fresh committed ticket joins the tail.
-        return $this->lockDatabase->admit($deadline);
+        $newTicket = $this->lockDatabase->admit($deadline);
+        $this->debug('ticket_requeued', ['lost_ticket' => $ticket, 'new_ticket' => $newTicket]);
+
+        return $newTicket;
     }
 
-    /** Executes exactly one BEGIN attempt with the caller's active busy_timeout restored in all branches. */
+    /**
+     * Attempts BEGIN IMMEDIATE once and restores the caller's busy timeout.
+     *
+     * Numeric BUSY or LOCKED means the fence was not acquired and returns false.
+     * Every other failure escapes; a restore failure rolls back a newly acquired
+     * fence and marks an unsuccessful rollback as an unknown PDO outcome.
+     */
     private function tryAppFence(): bool
     {
         $value = $this->appQuery('PRAGMA busy_timeout')->fetchColumn();
@@ -229,6 +329,7 @@ final class FairSQLiteLock
                 if (! LockDatabase::isBusyOrLocked($exception)) {
                     throw $exception;
                 }
+                $this->debug('lock_retry', ['operation' => 'app_fence']);
             }
         } finally {
             try {
@@ -237,6 +338,7 @@ final class FairSQLiteLock
                 if ($began) {
                     try {
                         $this->appPdo->rollBack();
+                        $this->debug('lock_rollback', ['operation' => 'busy_timeout_restore']);
                     } catch (Throwable $rollback) {
                         $this->markUnknownOutcome($rollback);
                         report($rollback);
@@ -253,6 +355,7 @@ final class FairSQLiteLock
     {
         try {
             $this->appPdo->rollBack();
+            $this->debug('lock_rollback', ['operation' => 'app_fence']);
         } catch (Throwable $exception) {
             $this->markUnknownOutcome($exception);
             throw $exception;
@@ -279,11 +382,17 @@ final class FairSQLiteLock
     {
         $clock = $this->monotonic;
         if ($deadline !== null && $clock() >= $deadline) {
+            $this->debug('wait_timeout', ['operation' => 'writer_wait']);
             throw new FairWaitTimeoutException('The SQLite fair writer wait deadline expired.');
         }
     }
 
-    /** @param callable(): bool $stateChanged */
+    /**
+     * Arms the waiter, performs the required second state check, then blocks.
+     *
+     * @param  callable(): bool  $stateChanged  Rechecks the exact queue condition after native arming.
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     */
     private function waitAfterStateCheck(callable $stateChanged, ?float $deadline): void
     {
         $clock = $this->monotonic;
@@ -297,6 +406,7 @@ final class FairSQLiteLock
 
     private function markUnknownOutcome(Throwable $rollback): void
     {
+        $this->debug('unknown_pdo_outcome', ['operation' => 'app_rollback']);
         try {
             ($this->onUnknownAppPdoOutcome)($rollback);
         } catch (Throwable $guardFailure) {
@@ -317,5 +427,22 @@ final class FairSQLiteLock
         }
 
         return $statement;
+    }
+
+    /**
+     * Emit one structured diagnostic for a real writer-state transition.
+     *
+     * @param  string  $event  Stable event identifier from the package logging contract.
+     * @param  array<string, int|string>  $context  Secret-free identifiers describing the transition.
+     */
+    private function debug(string $event, array $context = []): void
+    {
+        if ($this->debug) {
+            try {
+                Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
+            } catch (Throwable) {
+                // Optional diagnostics must never change lock ownership or retry behavior.
+            }
+        }
     }
 }

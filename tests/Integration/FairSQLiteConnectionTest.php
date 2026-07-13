@@ -2,17 +2,18 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\DatabaseTransactionsManager;
+use Illuminate\Database\DeadlockException;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionCommitting;
 use Illuminate\Database\Events\TransactionRolledBack;
-use Illuminate\Database\DatabaseTransactionsManager;
-use Illuminate\Database\DeadlockException;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Testing\DatabaseTransactionsManager as TestingDatabaseTransactionsManager;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Exceptions;
+use Illuminate\Support\Facades\Log;
 use Orchestra\Testbench\TestCase;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
@@ -25,12 +26,7 @@ class FairSQLiteRefreshDatabaseTestCase extends TestCase
 {
     use RefreshDatabase;
 
-    private ?\Closure $refreshDatabaseTeardownAssertion = null;
-
-    public function afterRefreshDatabaseTeardown(\Closure $callback): void
-    {
-        $this->refreshDatabaseTeardownAssertion = $callback;
-    }
+    private ?Closure $refreshDatabaseTeardownAssertion = null;
 
     protected function tearDown(): void
     {
@@ -39,6 +35,11 @@ class FairSQLiteRefreshDatabaseTestCase extends TestCase
         parent::tearDown();
 
         $assertion?->__invoke();
+    }
+
+    public function afterRefreshDatabaseTeardown(Closure $callback): void
+    {
+        $this->refreshDatabaseTeardownAssertion = $callback;
     }
 
     /** @return list<class-string> */
@@ -57,7 +58,7 @@ class FairSQLiteRefreshDatabaseTestCase extends TestCase
         if (! is_file($database)) {
             touch($database);
         }
-        $setup = new \PDO('sqlite:'.$database, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $setup = new PDO('sqlite:'.$database, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $setup->exec('CREATE TABLE IF NOT EXISTS refresh_examples (value TEXT NOT NULL)');
         $setup = null;
 
@@ -69,11 +70,13 @@ class FairSQLiteRefreshDatabaseTestCase extends TestCase
             'lock_directory' => $workspace.'/lock',
             'stale_head_seconds' => 10.0,
             'wait_strategy' => 'polling',
+            'debug' => false,
         ]);
         $app['config']->set('sqlite-fair', [
             'lock_directory' => $workspace.'/lock',
             'stale_head_seconds' => 10.0,
             'wait_strategy' => 'polling',
+            'debug' => false,
         ]);
     }
 }
@@ -90,6 +93,7 @@ beforeEach(function (): void {
         'lock_directory' => $this->lockDirectory,
         'stale_head_seconds' => 10.0,
         'wait_strategy' => 'polling',
+        'debug' => false,
     ]);
 
     $this->connection = (new FairSQLiteConnector())->connect([
@@ -135,7 +139,7 @@ test('refresh database uses the public fair transaction lifecycle on a file data
     expect($databasePath)->toBeString();
 
     $connection->statement('INSERT INTO refresh_examples (value) VALUES (?)', ['rolled-back-by-trait']);
-    $outside = new \PDO('sqlite:'.$databasePath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $outside = new PDO('sqlite:'.$databasePath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 
     expect($connection)->toBeInstanceOf(FairSQLiteConnection::class)
         ->and($connection->transactionLevel())->toBe(1)
@@ -145,7 +149,7 @@ test('refresh database uses the public fair transaction lifecycle on a file data
         ->and((int) $outside->query("SELECT COUNT(*) FROM refresh_examples WHERE value = 'rolled-back-by-trait'")->fetchColumn())->toBe(0);
 
     $this->afterRefreshDatabaseTeardown(function () use ($connection, $databasePath): void {
-        $observer = new \PDO('sqlite:'.$databasePath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $observer = new PDO('sqlite:'.$databasePath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 
         expect($connection->transactionLevel())->toBe(0)
             ->and($connection->getRawPdo())->toBeNull()
@@ -193,12 +197,13 @@ test('outer lifecycle orders pdo cleanup manager and event for ticketless and qu
     $record = static function (string $entry) use (&$log): void {
         $log[] = $entry;
     };
-    $pdo = new class('sqlite:'.$appPath, $record, $mode === 'queued') extends \PDO {
-        private readonly \Closure $record;
+    $pdo = new class('sqlite:'.$appPath, $record, $mode === 'queued') extends PDO
+    {
+        private readonly Closure $record;
 
         public function __construct(string $dsn, callable $record, private bool $busyOnFirstBegin)
         {
-            parent::__construct($dsn, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct($dsn, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             $this->record = $record(...);
         }
 
@@ -208,7 +213,7 @@ test('outer lifecycle orders pdo cleanup manager and event for ticketless and qu
                 if ($this->busyOnFirstBegin) {
                     $this->busyOnFirstBegin = false;
                     ($this->record)('pdo-begin-busy');
-                    $exception = new \PDOException('database is busy');
+                    $exception = new PDOException('database is busy');
                     $exception->errorInfo = ['HY000', 5, 'database is busy'];
 
                     throw $exception;
@@ -239,8 +244,9 @@ test('outer lifecycle orders pdo cleanup manager and event for ticketless and qu
         'driver' => 'fair-sqlite', 'name' => $name, 'database' => $appPath, 'prefix' => '',
         'lock_directory' => $lockPath, 'stale_head_seconds' => 10.0, 'wait_strategy' => 'polling',
     ], $appPath, $lockPath);
-    $connection->setTransactionManager(new class([], $record, $lockPath) extends DatabaseTransactionsManager {
-        private readonly \Closure $record;
+    $connection->setTransactionManager(new class([], $record, $lockPath) extends DatabaseTransactionsManager
+    {
+        private readonly Closure $record;
 
         public function __construct(array $connections, callable $record, private readonly string $lockPath)
         {
@@ -273,7 +279,7 @@ test('outer lifecycle orders pdo cleanup manager and event for ticketless and qu
 
         private function ticketCount(): int
         {
-            $observer = new \PDO('sqlite:'.$this->lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $observer = new PDO('sqlite:'.$this->lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 
             return (int) $observer->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
         }
@@ -342,10 +348,10 @@ test('manual nested rollback targets preserve or release the outer fair lifecycl
 });
 
 test('callback signature and return phpdoc remain compatible with laravel', function (): void {
-    $method = new \ReflectionMethod(FairSQLiteConnection::class, 'transaction');
+    $method = new ReflectionMethod(FairSQLiteConnection::class, 'transaction');
 
     expect($method->getParameters())->toHaveCount(2)
-        ->and($method->getParameters()[0]->getType()?->__toString())->toBe(\Closure::class)
+        ->and($method->getParameters()[0]->getType()?->__toString())->toBe(Closure::class)
         ->and($method->getParameters()[1]->getDefaultValue())->toBe(1)
         ->and($method->getDocComment())->toContain('@template TReturn', '@return TReturn');
 });
@@ -355,7 +361,7 @@ test('callback concurrency retries only after a completed outer rollback', funct
     $result = $this->connection->transaction(function (FairSQLiteConnection $connection) use (&$attempts): string {
         $attempts++;
         if ($attempts === 1) {
-            throw new \PDOException('database is locked');
+            throw new PDOException('database is locked');
         }
         $connection->statement('INSERT INTO examples (value) VALUES (?)', ['retried']);
 
@@ -373,7 +379,7 @@ test('nested callback concurrency becomes a deadlock exception without callback 
     try {
         $this->connection->transaction(function () use (&$attempts): never {
             $attempts++;
-            throw new \PDOException('database is locked');
+            throw new PDOException('database is locked');
         }, 2);
         $this->fail('Nested concurrency should not retry.');
     } catch (DeadlockException) {
@@ -385,7 +391,7 @@ test('nested callback concurrency becomes a deadlock exception without callback 
 });
 
 test('wait expiry before acquisition invokes the callback zero times', function (): void {
-    $holder = new \PDO('sqlite:'.$this->databasePath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $holder = new PDO('sqlite:'.$this->databasePath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $holder->exec('PRAGMA busy_timeout=0');
     $holder->exec('BEGIN IMMEDIATE');
     $calls = 0;
@@ -417,10 +423,10 @@ test('leading transaction control sql is rejected before state changes', functio
     'begin' => ' BEGIN IMMEDIATE',
     'commit' => "\ncommit",
     'rollback' => "\tRoLlBaCk",
-])->throws(\LogicException::class);
+])->throws(LogicException::class);
 
 test('pretend writes and transactions only populate the query log', function (): void {
-    $lock = new \PDO('sqlite:'.$this->lockDirectory.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $lock = new PDO('sqlite:'.$this->lockDirectory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $ticketsBefore = (int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
     $pdoTransactionBefore = $this->connection->getPdo()->inTransaction();
     $queries = $this->connection->pretend(function (FairSQLiteConnection $connection): void {
@@ -443,10 +449,11 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
     $lockPath = $workspace.'/lock';
-    $setup = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $setup = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $setup->exec('CREATE TABLE writes (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL)');
     $setup = null;
-    $pdo = new class('sqlite:'.$appPath, $lockPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath, $lockPath) extends PDO
+    {
         public int $beginAttempts = 0;
 
         /** @var list<int> */
@@ -456,7 +463,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
 
         public function __construct(string $dsn, private readonly string $lockPath)
         {
-            parent::__construct($dsn, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct($dsn, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
 
         public function exec(string $statement): int|false
@@ -465,7 +472,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
                 $this->beginAttempts++;
                 if ($this->busyOnFirstBegin) {
                     $this->busyOnFirstBegin = false;
-                    $exception = new \PDOException('database is busy');
+                    $exception = new PDOException('database is busy');
                     $exception->errorInfo = ['HY000', 5, 'database is busy'];
 
                     throw $exception;
@@ -477,7 +484,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
 
         public function commit(): bool
         {
-            $lock = new \PDO('sqlite:'.$this->lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $lock = new PDO('sqlite:'.$this->lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             $this->ticketsAtCommit[] = (int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
 
             return parent::commit();
@@ -485,8 +492,8 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
     };
     $installCleanupFailure = null;
     $pdo->sqliteCreateFunction('install_cleanup_failure', static function () use (&$installCleanupFailure): int {
-        if (! $installCleanupFailure instanceof \PDO) {
-            throw new \RuntimeException('The lock observer was not installed.');
+        if (! $installCleanupFailure instanceof PDO) {
+            throw new RuntimeException('The lock observer was not installed.');
         }
         $installCleanupFailure->exec(
             "CREATE TRIGGER fail_implicit_cleanup BEFORE DELETE ON tickets BEGIN SELECT RAISE(FAIL, 'implicit cleanup denied'); END",
@@ -495,7 +502,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
         return 1;
     });
     $pdo->exec(
-        "CREATE TRIGGER install_implicit_cleanup_failure AFTER INSERT ON writes "
+        'CREATE TRIGGER install_implicit_cleanup_failure AFTER INSERT ON writes '
         ."WHEN NEW.value = 'cleanup-failure' BEGIN SELECT install_cleanup_failure(); END",
     );
     $name = 'eloquent-builder-'.str_replace('.', '-', uniqid('', true));
@@ -508,7 +515,8 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
         'database' => $appPath,
     ]);
     app('db')->extend($name, static fn (): FairSQLiteConnection => $connection);
-    $model = new class extends Model {
+    $model = new class extends Model
+    {
         public $timestamps = false;
 
         protected $table = 'writes';
@@ -524,7 +532,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
 
     expect($connection->table('writes')->insert(['value' => 'builder']))->toBeTrue()
         ->and($pdo->ticketsAtCommit)->toBe([1, 0]);
-    $lock = new \PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $lock = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $ticketsBeforeRead = (int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
     expect($connection->table('writes')->orderBy('id')->pluck('value')->all())->toBe(['eloquent', 'builder'])
         ->and((int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn())->toBe($ticketsBeforeRead)
@@ -540,7 +548,7 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
         ->and($connection->getPdo()->inTransaction())->toBeFalse()
         ->and((int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn())->toBe(1)
         ->and($pdo->ticketsAtCommit)->toBe([1, 0, 1]);
-    Exceptions::assertReported(\PDOException::class);
+    Exceptions::assertReported(PDOException::class);
 });
 
 test('run nontransactional requires exactly one write and returns its callback result', function (): void {
@@ -560,10 +568,10 @@ test('run nontransactional returns persisted success after cleanup failure and r
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
     $lockPath = $workspace.'/lock';
-    $pdo = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('CREATE TABLE writes (value TEXT NOT NULL)');
     $pdo->sqliteCreateFunction('install_nontransactional_cleanup_failure', static function () use ($lockPath): int {
-        $lock = new \PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $lock = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $lock->exec(
             "CREATE TRIGGER fail_nontransactional_cleanup BEFORE DELETE ON tickets BEGIN SELECT RAISE(FAIL, 'nontransactional cleanup denied'); END",
         );
@@ -571,7 +579,7 @@ test('run nontransactional returns persisted success after cleanup failure and r
         return 1;
     });
     $pdo->exec(
-        "CREATE TRIGGER install_nontransactional_cleanup_failure AFTER INSERT ON writes "
+        'CREATE TRIGGER install_nontransactional_cleanup_failure AFTER INSERT ON writes '
         ."WHEN NEW.value = 'nontransactional-cleanup' BEGIN SELECT install_nontransactional_cleanup_failure(); END",
     );
     $connection = new FairSQLiteConnection($pdo, $appPath, '', [
@@ -585,13 +593,13 @@ test('run nontransactional returns persisted success after cleanup failure and r
 
         return 'kept-result';
     });
-    $lock = new \PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $lock = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     expect($result)->toBe('kept-result')
         ->and($connection->table('writes')->where('value', 'nontransactional-cleanup')->count())->toBe(1)
         ->and($connection->transactionLevel())->toBe(0)
         ->and($connection->getPdo()->inTransaction())->toBeFalse()
         ->and((int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn())->toBe(1);
-    Exceptions::assertReported(\PDOException::class);
+    Exceptions::assertReported(PDOException::class);
 
     $lock->exec('DROP TRIGGER fail_nontransactional_cleanup');
     $connection->beginTransaction();
@@ -614,7 +622,7 @@ test('run nontransactional rejects zero writes recursion transactions and second
             })(),
         };
     });
-})->with(['zero', 'recursive', 'transaction', 'second'])->throws(\LogicException::class);
+})->with(['zero', 'recursive', 'transaction', 'second'])->throws(LogicException::class);
 
 test('wait timeout scopes preserve results and permit one top level fair operation', function (): void {
     $result = $this->connection->withWaitTimeout(1.0, function (FairSQLiteConnection $connection): string {
@@ -629,17 +637,35 @@ test('wait timeout scopes preserve results and permit one top level fair operati
         $connection->statement('INSERT INTO examples (value) VALUES (?)', ['two']);
         $connection->statement('INSERT INTO examples (value) VALUES (?)', ['three']);
     });
-})->throws(\LogicException::class);
+})->throws(LogicException::class);
+
+test('wait timeout scopes reject successful callbacks without a fair operation and restore state', function (): void {
+    try {
+        $this->connection->withWaitTimeout(1.0, static fn (): string => 'unused');
+        $this->fail('A successful wait-timeout scope without a fair operation should fail.');
+    } catch (LogicException $exception) {
+        expect($exception->getMessage())->toBe('A wait-timeout scope permits exactly one top-level fair operation.');
+    }
+
+    $result = $this->connection->withWaitTimeout(1.0, function (FairSQLiteConnection $connection): string {
+        $connection->statement('INSERT INTO examples (value) VALUES (?)', ['after-zero-call']);
+
+        return 'restored';
+    });
+
+    expect($result)->toBe('restored');
+});
 
 test('nested wait timeout uses the earliest absolute deadline and restores scope state', function (): void {
     $workspace = $this->workspace.'/controlled-nested-deadline';
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
     $lockPath = $workspace.'/lock';
-    $setup = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $setup = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $setup->exec('CREATE TABLE writes (value TEXT NOT NULL)');
     $setup = null;
-    $pdo = new class('sqlite:'.$appPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath) extends PDO
+    {
         public int $businessSqlAttempts = 0;
 
         public function exec(string $statement): int|false
@@ -672,7 +698,7 @@ test('nested wait timeout uses the earliest absolute deadline and restores scope
     $connection->unprepared("INSERT INTO writes (value) VALUES ('bootstrap')");
     $pdo->businessSqlAttempts = 0;
 
-    $holder = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $holder = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $holder->exec('PRAGMA busy_timeout=0');
     $holder->exec('BEGIN IMMEDIATE');
     $expiringScope = true;
@@ -712,7 +738,7 @@ test('nested wait timeout uses the earliest absolute deadline and restores scope
 
 test('wait timeout rejects non finite and non positive values', function (float $seconds): void {
     $this->connection->withWaitTimeout($seconds, static fn (): null => null);
-})->with([0.0, -1.0, INF, NAN])->throws(\LogicException::class);
+})->with([0.0, -1.0, INF, NAN])->throws(LogicException::class);
 
 test('callback and pre business rollback unknown keep the original error and unfinished framework state', function (string $mode): void {
     Exceptions::fake();
@@ -720,16 +746,17 @@ test('callback and pre business rollback unknown keep the original error and unf
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
     $lockPath = $workspace.'/lock';
-    $setup = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $setup = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $setup->exec('CREATE TABLE writes (value TEXT NOT NULL)');
     $setup = null;
-    $pdo = new class('sqlite:'.$appPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath) extends PDO
+    {
         public function rollBack(): bool
         {
-            throw new \PDOException('rollback outcome unknown');
+            throw new PDOException('rollback outcome unknown');
         }
     };
-    $weak = \WeakReference::create($pdo);
+    $weak = WeakReference::create($pdo);
     $connection = new FairSQLiteConnection($pdo, $appPath, '', [
         'driver' => 'fair-sqlite',
         'name' => 'unknown-'.$mode.'-'.str_replace('.', '-', uniqid('', true)),
@@ -760,25 +787,26 @@ test('callback and pre business rollback unknown keep the original error and unf
                 $active->afterCommit(function () use (&$callbackRan): void {
                     $callbackRan = true;
                 });
-                throw new \RuntimeException('business primary');
+                throw new RuntimeException('business primary');
             });
             $this->fail('The callback transaction should have failed.');
-        } catch (\RuntimeException $exception) {
+        } catch (RuntimeException $exception) {
             expect($exception->getMessage())->toBe('business primary');
         }
         expect($connection->transactionLevel())->toBe(1)
             ->and($events)->toBe([TransactionBeginning::class]);
     } else {
-        $connection->setTransactionManager(new class([]) extends DatabaseTransactionsManager {
+        $connection->setTransactionManager(new class([]) extends DatabaseTransactionsManager
+        {
             public function begin($connection, $level)
             {
-                throw new \RuntimeException('manager primary');
+                throw new RuntimeException('manager primary');
             }
         });
         try {
             $connection->beginTransaction();
             $this->fail('The transaction manager should have failed.');
-        } catch (\RuntimeException $exception) {
+        } catch (RuntimeException $exception) {
             expect($exception->getMessage())->toBe('manager primary');
         }
         expect($connection->transactionLevel())->toBe(0)
@@ -789,20 +817,21 @@ test('callback and pre business rollback unknown keep the original error and unf
     expect($connection->hasUnknownPdoOutcome())->toBeTrue()
         ->and($callbackRan)->toBeFalse()
         ->and($weak->get())->toBeNull();
-    Exceptions::assertReported(\PDOException::class);
+    Exceptions::assertReported(PDOException::class);
 })->with(['callback', 'prebusiness']);
 
 test('callback commit unknown occurs after committing and never retries or finalizes framework state', function (): void {
     $workspace = $this->workspace.'/callback-commit-unknown';
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
-    $setup = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $setup = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $setup->exec('CREATE TABLE writes (value TEXT NOT NULL)');
     $setup = null;
-    $pdo = new class('sqlite:'.$appPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath) extends PDO
+    {
         public function commit(): bool
         {
-            throw new \PDOException('commit outcome unknown');
+            throw new PDOException('commit outcome unknown');
         }
     };
     $connection = new FairSQLiteConnection($pdo, $appPath, '', [
@@ -828,7 +857,7 @@ test('callback commit unknown occurs after committing and never retries or final
             $attempts++;
         }, 2);
         $this->fail('Commit with unknown outcome should fail.');
-    } catch (\PDOException $exception) {
+    } catch (PDOException $exception) {
         expect($exception->getMessage())->toBe('commit outcome unknown');
     }
 
@@ -842,11 +871,12 @@ test('savepoint rollback unknown preserves manager pending callback and event st
     $workspace = $this->workspace.'/savepoint-manager-unknown';
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
-    $pdo = new class('sqlite:'.$appPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath) extends PDO
+    {
         public function exec(string $statement): int|false
         {
             if (str_starts_with($statement, 'ROLLBACK TO SAVEPOINT')) {
-                throw new \PDOException('savepoint rollback outcome unknown');
+                throw new PDOException('savepoint rollback outcome unknown');
             }
 
             return parent::exec($statement);
@@ -856,7 +886,8 @@ test('savepoint rollback unknown preserves manager pending callback and event st
         'driver' => 'fair-sqlite', 'name' => 'savepoint-manager-unknown', 'database' => $appPath, 'prefix' => '',
         'lock_directory' => $workspace.'/lock', 'stale_head_seconds' => 10.0, 'wait_strategy' => 'polling',
     ], $appPath, $workspace.'/lock');
-    $manager = new class([]) extends DatabaseTransactionsManager {
+    $manager = new class([]) extends DatabaseTransactionsManager
+    {
         public int $rollbackCalls = 0;
 
         public function rollback($connection, $newTransactionLevel)
@@ -883,7 +914,7 @@ test('savepoint rollback unknown preserves manager pending callback and event st
     try {
         $connection->rollBack(1);
         $this->fail('Savepoint rollback with unknown outcome should fail.');
-    } catch (\PDOException $exception) {
+    } catch (PDOException $exception) {
         expect($exception->getMessage())->toBe('savepoint rollback outcome unknown');
     }
 
@@ -898,13 +929,15 @@ test('unknown identity blocks purge reconnect connector aliases and partial path
     mkdir($workspace, 0775, true);
     $appPath = $workspace.'/app.sqlite';
     $lockPath = $workspace.'/lock';
-    $setup = new \PDO('sqlite:'.$appPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    mkdir($lockPath, 0775, true);
+    $setup = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $setup->exec('CREATE TABLE writes (value TEXT NOT NULL)');
     $setup = null;
-    $pdo = new class('sqlite:'.$appPath) extends \PDO {
+    $pdo = new class('sqlite:'.$appPath) extends PDO
+    {
         public function commit(): bool
         {
-            throw new \PDOException('commit outcome unknown');
+            throw new PDOException('commit outcome unknown');
         }
     };
     $name = 'guarded-'.str_replace('.', '-', uniqid('', true));
@@ -919,13 +952,12 @@ test('unknown identity blocks purge reconnect connector aliases and partial path
     ];
     $connection = new FairSQLiteConnection($pdo, $appPath, '', $config, $appPath, $lockPath);
     expect($connection->hasUnknownPdoOutcome())->toBeFalse()
-        ->and(is_dir($lockPath))->toBeTrue()
         ->and(is_file($lockPath.'/lock.sqlite'))->toBeFalse();
 
     $connection->beginTransaction();
     try {
         $connection->commit();
-    } catch (\PDOException) {
+    } catch (PDOException) {
     }
     expect($connection->hasUnknownPdoOutcome())->toBeTrue();
 
@@ -962,7 +994,7 @@ test('laravel manager reconnect rebuilds fair coordination around the fresh eage
     expect($connection)->toBeInstanceOf(FairSQLiteConnection::class);
     $connection->unprepared('CREATE TABLE writes (value TEXT NOT NULL)');
     $oldPdo = $connection->getPdo();
-    $weak = \WeakReference::create($oldPdo);
+    $weak = WeakReference::create($oldPdo);
     $oldPdo = null;
 
     $reconnected = app('db')->reconnect($name);
@@ -993,7 +1025,7 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
     $connection->runNonTransactional(static function (FairSQLiteConnection $active): void {
         $active->statement('INSERT INTO writes (value) VALUES (?)', ['bootstrap']);
     });
-    $lockPdo = new \PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $lockPdo = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lockPdo->exec('INSERT INTO tickets DEFAULT VALUES');
 
     if (str_starts_with($outcome, 'callback-')) {
@@ -1003,11 +1035,11 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
                 $attempts++;
                 $lockPdo->exec('DROP TABLE tickets');
                 throw $outcome === 'callback-concurrency'
-                    ? new \PDOException('database is locked')
-                    : new \RuntimeException('business primary');
+                    ? new PDOException('database is locked')
+                    : new RuntimeException('business primary');
             }, 2);
             $this->fail('The callback should preserve its original failure.');
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             expect($exception->getMessage())->toBe(
                 $outcome === 'callback-concurrency' ? 'database is locked' : 'business primary',
             );
@@ -1016,7 +1048,7 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
         expect($attempts)->toBe(1)
             ->and($connection->transactionLevel())->toBe(0)
             ->and($connection->table('writes')->pluck('value')->all())->toBe(['bootstrap']);
-        Exceptions::assertReported(\PDOException::class);
+        Exceptions::assertReported(PDOException::class);
 
         return;
     }
@@ -1029,7 +1061,7 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
         $connection->commit();
         expect($connection->transactionLevel())->toBe(0)
             ->and($connection->table('writes')->pluck('value')->all())->toBe(['bootstrap', 'commit']);
-        Exceptions::assertReported(\PDOException::class);
+        Exceptions::assertReported(PDOException::class);
 
         return;
     }
@@ -1037,8 +1069,47 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
     try {
         $connection->rollBack();
         $this->fail('Rollback should expose its ticket cleanup failure.');
-    } catch (\PDOException) {
+    } catch (PDOException) {
     }
     expect($connection->transactionLevel())->toBe(0)
         ->and($connection->table('writes')->pluck('value')->all())->toBe(['bootstrap']);
 })->with(['commit', 'rollback', 'callback-concurrency', 'callback-business']);
+
+test('debug logging stays silent for a normal direct write when disabled', function (): void {
+    Log::spy();
+
+    $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['quiet']);
+
+    Log::shouldNotHaveReceived('debug');
+});
+
+test('debug logging reports representative bootstrap and ticket transitions', function (): void {
+    $workspace = $this->workspace.'/debug-transitions';
+    mkdir($workspace, 0775, true);
+    $appPath = $workspace.'/app.sqlite';
+    touch($appPath);
+
+    Log::spy();
+    $connection = (new FairSQLiteConnector())->connect([
+        'driver' => 'fair-sqlite',
+        'database' => $appPath,
+        'prefix' => '',
+        'lock_directory' => $workspace.'/lock',
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+        'debug' => true,
+    ], 'debug-transitions-'.str_replace('.', '-', uniqid('', true)));
+    $connection->runNonTransactional(static function (FairSQLiteConnection $active): void {
+        $active->unprepared('CREATE TABLE debug_writes (value TEXT NOT NULL)');
+    });
+
+    Log::shouldHaveReceived('debug')->withArgs(
+        static fn (string $message, array $context): bool => $message === 'Fair SQLite transition.'
+            && ($context['event'] ?? null) === 'lock_database_bootstrap',
+    );
+    Log::shouldHaveReceived('debug')->withArgs(
+        static fn (string $message, array $context): bool => $message === 'Fair SQLite transition.'
+            && ($context['event'] ?? null) === 'ticket_created'
+            && is_int($context['ticket'] ?? null),
+    );
+});

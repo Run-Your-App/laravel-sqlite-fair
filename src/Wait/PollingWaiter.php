@@ -23,7 +23,7 @@ final class PollingWaiter implements Waiter
     /**
      * Creates the connected local sockets used for every polling interval.
      *
-     * @return void
+     * @return void The adapter owns a connected socket pair for bounded polling.
      *
      * @throws RuntimeException When the loopback server, address, client, or accepted socket cannot be created.
      */
@@ -53,7 +53,7 @@ final class PollingWaiter implements Waiter
     /**
      * Closes both sockets owned by this polling adapter.
      *
-     * @return void
+     * @return void Both sockets owned by the adapter have been closed.
      */
     public function __destruct()
     {
@@ -67,14 +67,14 @@ final class PollingWaiter implements Waiter
      * Polling has no external event source to register, so this method intentionally
      * keeps the existing socket pair unchanged.
      *
-     * @return void
+     * @return void The existing polling boundary remains ready for the state check.
      */
     public function arm(): void {}
 
     /**
      * Leaves the polling adapter unchanged because it buffers no wake events.
      *
-     * @return void
+     * @return void No buffered event state exists to consume.
      */
     public function drain(): void {}
 
@@ -86,7 +86,7 @@ final class PollingWaiter implements Waiter
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
-     * @return void
+     * @return void The bounded interval or supplied deadline ended the wait.
      *
      * @throws RuntimeException When stream selection cannot complete.
      */

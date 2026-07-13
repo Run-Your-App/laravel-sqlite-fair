@@ -17,14 +17,23 @@ it('arms and consumes real single and coalesced kqueue directory events on darwi
     $injected = false;
     $systemCall = static function (FFI $ffi, string $function, mixed ...$arguments) use (&$blockedResult, &$injected, $directory, $events): int {
         $callback = [$ffi, $function];
-        if (! is_callable($callback)) { throw new RuntimeException('Real kqueue callback is unavailable.'); }
+        if (! is_callable($callback)) {
+            throw new RuntimeException('Real kqueue callback is unavailable.');
+        }
         if ($function === 'kevent' && $arguments[5] instanceof FFI\CData && $arguments[5]->tv_nsec > 0 && ! $injected) {
             $injected = true;
-            for ($event = 0; $event < $events; $event++) { touch($directory.'/event-'.$event); }
+            for ($event = 0; $event < $events; $event++) {
+                touch($directory.'/event-'.$event);
+            }
         }
         $result = $callback(...$arguments);
-        if (! is_int($result)) { throw new RuntimeException('Real kqueue callback returned a non-integer.'); }
-        if ($injected && $function === 'kevent' && $arguments[5] instanceof FFI\CData && $arguments[5]->tv_nsec > 0) { $blockedResult = $result; }
+        if (! is_int($result)) {
+            throw new RuntimeException('Real kqueue callback returned a non-integer.');
+        }
+        if ($injected && $function === 'kevent' && $arguments[5] instanceof FFI\CData && $arguments[5]->tv_nsec > 0) {
+            $blockedResult = $result;
+        }
+
         return $result;
     };
     $waiter = new KqueueWaiter($directory, false, $systemCall);
@@ -54,6 +63,7 @@ it('degrades only auto after a deterministic post-arm kqueue failure', function 
         if (! is_int($result)) {
             throw new RuntimeException('Injected kqueue callback returned a non-integer.');
         }
+
         return $result;
     };
     $waiter = new KqueueWaiter($directory, $auto, $systemCall);
@@ -64,5 +74,50 @@ it('degrades only auto after a deterministic post-arm kqueue failure', function 
         expect(true)->toBeTrue();
     } else {
         expect(fn () => $waiter->arm())->toThrow(RuntimeException::class);
+    }
+})->with([true, false]);
+
+it('degrades only auto after a deterministic post-arm kqueue drain failure', function (bool $auto) {
+    if (PHP_OS_FAMILY !== 'Darwin') {
+        $this->markTestSkipped('The deterministic kqueue drain failure proof belongs to Darwin hosts.');
+    }
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/kqueue-drain-failure-'.($auto ? 'auto' : 'native');
+    mkdir($directory, 0775, true);
+    $drainCalls = 0;
+    $keventCalls = 0;
+    $systemCall = static function (FFI $ffi, string $function, mixed ...$arguments) use (&$drainCalls, &$keventCalls): int {
+        if ($function === 'kevent') {
+            $keventCalls++;
+        }
+        if ($function === 'kevent'
+            && $arguments[1] === null
+            && $arguments[2] === 0
+            && $arguments[5] instanceof FFI\CData
+            && $arguments[5]->tv_nsec === 0
+            && ++$drainCalls > 1) {
+            return -1;
+        }
+        $callback = [$ffi, $function];
+        if (! is_callable($callback)) {
+            throw new RuntimeException('Injected kqueue callback is not callable.');
+        }
+        $result = $callback(...$arguments);
+        if (! is_int($result)) {
+            throw new RuntimeException('Injected kqueue callback returned a non-integer.');
+        }
+
+        return $result;
+    };
+    $waiter = new KqueueWaiter($directory, $auto, $systemCall);
+
+    if ($auto) {
+        $waiter->drain();
+        $nativeCallsAfterFailure = $keventCalls;
+        $waiter->arm();
+        expect($drainCalls)->toBe(2)
+            ->and($keventCalls)->toBe($nativeCallsAfterFailure);
+    } else {
+        expect(fn () => $waiter->drain())->toThrow(RuntimeException::class, 'could not be drained')
+            ->and($drainCalls)->toBe(2);
     }
 })->with([true, false]);

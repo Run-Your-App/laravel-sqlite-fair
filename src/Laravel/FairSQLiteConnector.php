@@ -8,24 +8,32 @@ use Illuminate\Database\Connectors\SQLiteConnector;
 use Illuminate\Database\SQLiteConnection;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
+use Throwable;
 
 /**
- * Build validated Laravel SQLite connections.
+ * Builds validated Laravel SQLite connections for the `fair-sqlite` driver.
  *
  * Memory databases stay on Laravel's upstream lifecycle. File-backed databases
  * receive validated fair configuration and deterministic application/lock path
  * identities before the application PDO is opened.
+ *
+ * @internal Laravel applications use this connector through `FairSQLiteServiceProvider`.
  */
 final class FairSQLiteConnector
 {
     /**
-     * Create the configured Laravel connection.
+     * Creates the configured Laravel connection.
+     *
+     * Memory DSNs bypass fair-only validation and return Laravel's upstream connection. File databases merge package
+     * defaults with connection overrides, validate their canonical application/lock identity before opening PDO, and
+     * return a `FairSQLiteConnection` using Laravel's normal SQLite PDO options.
      *
      * @param  array<string, mixed>  $config  Laravel connection values plus optional fair overrides.
      * @param  string  $name  Stable Laravel connection name used by the process-local identity guard.
      * @return SQLiteConnection The upstream memory connection or the file-backed fair connection.
      *
-     * @throws FairSQLiteException When configuration, paths, or identity are invalid.
+     * @throws FairSQLiteException When configuration, paths, identity, or a required fair waiter capability is invalid.
+     * @throws Throwable When Laravel cannot open the application PDO or native waiter startup fails.
      */
     public function connect(array $config, string $name): SQLiteConnection
     {
@@ -152,7 +160,7 @@ final class FairSQLiteConnector
     }
 
     /**
-     * Decide whether a path is absolute for an operating-system family.
+     * Decides whether a path is absolute for an operating-system family.
      *
      * Production and tests share this side-effect-free decision so POSIX, WSL,
      * Windows drive, and Windows UNC semantics cannot drift.

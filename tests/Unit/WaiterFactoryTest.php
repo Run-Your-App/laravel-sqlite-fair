@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
-use RunYourApp\LaravelSqliteFair\Wait\WaiterFactory;
 use RunYourApp\LaravelSqliteFair\Wait\InotifyWaiter;
 use RunYourApp\LaravelSqliteFair\Wait\KqueueWaiter;
+use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
+use RunYourApp\LaravelSqliteFair\Wait\WaiterFactory;
 
 it('reports the deterministic host capability matrix', function (string $family, bool $native, string $platform, bool $available) {
     expect(WaiterFactory::capabilities($family, $native, $native))->toBe([
@@ -37,8 +37,12 @@ it('uses a working polling protocol for simulated windows auto capability', func
 it('selects the concrete strategy for the current host', function () {
     $autoDirectory = $GLOBALS['sqliteFairTestRunDirectory'].'/factory-host-auto';
     $nativeDirectory = $GLOBALS['sqliteFairTestRunDirectory'].'/factory-host-native';
-    if (! is_dir($autoDirectory)) { mkdir($autoDirectory, 0775, true); }
-    if (! is_dir($nativeDirectory)) { mkdir($nativeDirectory, 0775, true); }
+    if (! is_dir($autoDirectory)) {
+        mkdir($autoDirectory, 0775, true);
+    }
+    if (! is_dir($nativeDirectory)) {
+        mkdir($nativeDirectory, 0775, true);
+    }
     $expected = match (PHP_OS_FAMILY) {
         'Linux' => InotifyWaiter::class,
         'Darwin' => KqueueWaiter::class,

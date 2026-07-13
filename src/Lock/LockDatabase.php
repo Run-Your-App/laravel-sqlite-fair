@@ -14,10 +14,16 @@ use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
 /**
- * Owns the private SQLite ticket database and every retryable lock-database unit.
+ * Owns the private SQLite ticket database for one application database.
+ *
+ * FairSQLiteLock uses this owner to admit, inspect, recover, and remove committed
+ * FIFO tickets. The PDO is opened lazily and invalidated after an indeterminate
+ * handle outcome. Each retryable statement or mutation is bounded by the caller's
+ * monotonic deadline and coordinated through the shared Waiter.
  *
  * Mutation units are intentionally separate so a commit with an unknown result is
- * never replayed. The application database is neither identified nor opened here.
+ * never replayed. This owner creates and validates only `lock.sqlite`; it never
+ * identifies, opens, or mutates the application database.
  *
  * @internal
  */
@@ -32,7 +38,7 @@ final class LockDatabase
     private $pdoFactory;
 
     /**
-     * Create the lazy private ticket-database owner.
+     * Creates the lazy private ticket-database owner.
      *
      * No directory, PDO, PRAGMA, or schema is touched until {@see open()}.
      * The optional factory exists only for deterministic package verification.
@@ -42,6 +48,7 @@ final class LockDatabase
      * @param  callable(): float  $monotonic  Monotonic seconds used for absolute deadlines.
      * @param  (callable(string): PDO)|null  $pdoFactory  Internal PDO-construction seam receiving lock.sqlite's path.
      * @param  bool  $debug  Whether abnormal transitions emit structured Laravel debug logs.
+     * @return void The lazy owner is initialized without opening its PDO.
      *
      * @internal
      */
@@ -67,7 +74,7 @@ final class LockDatabase
      * the next call to repeat the complete handle setup.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
-     * @return void
+     * @return void A validated lock-database handle is available for subsequent operations.
      *
      * @throws Throwable When filesystem setup, PDO setup, bootstrap, validation, or waiting fails.
      */
@@ -94,20 +101,20 @@ final class LockDatabase
     }
 
     /**
-     * Prepare the shared ticket-database and native-waiter directory.
+     * Creates the shared ticket-database and native-waiter directory when missing.
      *
-     * @param  string  $directory  Absolute directory to validate or create recursively.
-     * @return void
+     * Path semantics belong to FairSQLiteConnector. This method performs only the
+     * idempotent filesystem creation needed by the connector and lazy direct owner.
      *
-     * @throws RuntimeException When the path is not absolute or cannot be created.
+     * @param  string  $directory  Caller-validated directory to create recursively.
+     * @return void The supplied directory exists when the method returns.
+     *
+     * @throws RuntimeException When the directory cannot be created.
      *
      * @internal
      */
     public static function prepareDirectory(string $directory): void
     {
-        if (! str_starts_with($directory, DIRECTORY_SEPARATOR) && preg_match('/^[A-Za-z]:[\\\\\/]/', $directory) !== 1) {
-            throw new RuntimeException('The SQLite fair lock directory must be absolute.');
-        }
         if (! is_dir($directory) && ! mkdir($directory, 0775, true) && ! is_dir($directory)) {
             throw new RuntimeException("The SQLite fair lock directory [{$directory}] could not be created.");
         }
@@ -126,7 +133,7 @@ final class LockDatabase
         $this->open($deadline);
 
         return $this->retryStatement(function (): ?int {
-            $value = $this->query('SELECT ticket FROM tickets ORDER BY ticket ASC LIMIT 1')->fetchColumn();
+            $value = $this->queryValue('SELECT ticket FROM tickets ORDER BY ticket ASC LIMIT 1');
 
             if ($value === false) {
                 return null;
@@ -168,7 +175,7 @@ final class LockDatabase
      *
      * @param  int  $observedForeignHead  Exact foreign head observed again under the application writer fence.
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
-     * @return void
+     * @return void The exact foreign ticket is absent after a known committed delete.
      *
      * @throws Throwable When the delete cannot reach a known committed outcome.
      */
@@ -176,7 +183,11 @@ final class LockDatabase
     {
         $this->mutation(function (PDO $pdo) use ($observedForeignHead): null {
             $statement = $this->prepare($pdo, 'DELETE FROM tickets WHERE ticket = :observedForeignHead');
-            $statement->execute(['observedForeignHead' => $observedForeignHead]);
+            try {
+                $statement->execute(['observedForeignHead' => $observedForeignHead]);
+            } finally {
+                $statement->closeCursor();
+            }
 
             return null;
         }, $deadline);
@@ -187,7 +198,7 @@ final class LockDatabase
      *
      * @param  int  $ownTicket  Ticket owned by the calling fair connection.
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
-     * @return void
+     * @return void The exact owned ticket is absent after a known committed delete.
      *
      * @throws Throwable When cleanup cannot reach a known committed outcome.
      */
@@ -195,7 +206,11 @@ final class LockDatabase
     {
         $this->mutation(function (PDO $pdo) use ($ownTicket): null {
             $statement = $this->prepare($pdo, 'DELETE FROM tickets WHERE ticket = :ownTicket');
-            $statement->execute(['ownTicket' => $ownTicket]);
+            try {
+                $statement->execute(['ownTicket' => $ownTicket]);
+            } finally {
+                $statement->closeCursor();
+            }
 
             return null;
         }, $deadline);
@@ -205,7 +220,7 @@ final class LockDatabase
      * Perform one nonblocking emergency cleanup attempt.
      *
      * @param  int  $ownTicket  Ticket owned by the aborting connection.
-     * @return void
+     * @return void The single nonblocking cleanup attempt completed successfully.
      *
      * @throws Throwable When the existing handle cannot complete the one permitted attempt.
      */
@@ -218,10 +233,14 @@ final class LockDatabase
         $pdo->exec('PRAGMA busy_timeout=0');
         $active = false;
         try {
-            $pdo->exec('BEGIN IMMEDIATE');
+            $pdo->exec('BEGIN EXCLUSIVE');
             $active = true;
             $statement = $this->prepare($pdo, 'DELETE FROM tickets WHERE ticket = :ownTicket');
-            $statement->execute(['ownTicket' => $ownTicket]);
+            try {
+                $statement->execute(['ownTicket' => $ownTicket]);
+            } finally {
+                $statement->closeCursor();
+            }
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($active && $pdo->inTransaction()) {
@@ -229,6 +248,7 @@ final class LockDatabase
                     $pdo->rollBack();
                     $this->debug('lock_rollback', ['operation' => 'cleanup']);
                 } catch (Throwable $rollback) {
+                    $this->debug('cleanup_failed', ['operation' => 'cleanup_rollback']);
                     report($rollback);
                     $this->invalidate();
                 }
@@ -250,12 +270,7 @@ final class LockDatabase
      */
     public static function isBusyOrLocked(Throwable $exception): bool
     {
-        if (! $exception instanceof PDOException || ! is_array($exception->errorInfo) || ! isset($exception->errorInfo[1])) {
-            return false;
-        }
-        $code = (int) $exception->errorInfo[1];
-
-        return in_array($code & 0xFF, [5, 6], true);
+        return in_array(self::sqliteResultCode($exception), [5, 6], true);
     }
 
     private function configurePersistentPragmas(?float $deadline): void
@@ -267,26 +282,19 @@ final class LockDatabase
 
     private function bootstrapSchema(?float $deadline): void
     {
-        $version = (int) $this->retryStatement(fn (): mixed => $this->query('PRAGMA user_version')->fetchColumn(), $deadline);
+        $version = (int) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA user_version'), $deadline);
         $tables = $this->tables($deadline);
-        if ($version === 1) {
-            if ($tables !== ['tickets']) {
-                throw new RuntimeException('The SQLite fair lock database schema is invalid.');
-            }
-
+        if ($version === 1 && $tables === ['tickets']) {
             return;
         }
-        if ($version !== 0 || $tables !== []) {
-            throw new RuntimeException('The SQLite fair lock database has an unsupported schema version.');
-        }
 
-        $this->mutation(function (PDO $pdo): null {
-            // Another process may have completed bootstrap after the autocommit precheck.
-            // Re-reading under BEGIN IMMEDIATE makes this transaction the schema decision point.
+        $bootstrapped = $this->mutation(function (PDO $pdo): bool {
+            // The two autocommit prechecks can straddle another process's bootstrap.
+            // Only this exclusive re-read may reject or create the shared schema.
             $currentVersion = $this->queryInteger('PRAGMA user_version');
             $currentTables = $this->stringColumnNow("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
             if ($currentVersion === 1 && $currentTables === ['tickets']) {
-                return null;
+                return false;
             }
             if ($currentVersion !== 0 || $currentTables !== []) {
                 throw new RuntimeException('The SQLite fair lock database changed to an unsupported schema during bootstrap.');
@@ -294,20 +302,23 @@ final class LockDatabase
             $pdo->exec('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY AUTOINCREMENT)');
             $pdo->exec('PRAGMA user_version=1');
 
-            return null;
+            return true;
         }, $deadline);
-        $this->debug('lock_database_bootstrap');
+
+        if ($bootstrapped) {
+            $this->debug('lock_database_bootstrap');
+        }
     }
 
     private function validate(?float $deadline): void
     {
-        if ((int) $this->retryStatement(fn (): mixed => $this->query('PRAGMA user_version')->fetchColumn(), $deadline) !== 1
+        if ((int) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA user_version'), $deadline) !== 1
             || $this->tables($deadline) !== ['tickets']
             || $this->internalTables($deadline) !== ['sqlite_sequence']
             || $this->ticketColumns($deadline) !== [['ticket', 'INTEGER', 1]]) {
             throw new RuntimeException('The SQLite fair lock database schema validation failed.');
         }
-        $sql = (string) $this->retryStatement(fn (): mixed => $this->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='tickets'")->fetchColumn(), $deadline);
+        $sql = (string) $this->retryStatement(fn (): mixed => $this->queryValue("SELECT sql FROM sqlite_master WHERE type='table' AND name='tickets'"), $deadline);
         if (preg_match('/^CREATE TABLE tickets \(ticket INTEGER PRIMARY KEY AUTOINCREMENT\)$/i', $sql) !== 1) {
             throw new RuntimeException('The SQLite fair ticket table does not own the required AUTOINCREMENT key.');
         }
@@ -324,7 +335,12 @@ final class LockDatabase
     private function ticketColumns(?float $deadline): array
     {
         return $this->retryStatement(function (): array {
-            $rows = $this->query('PRAGMA table_info(tickets)')->fetchAll(PDO::FETCH_ASSOC);
+            $statement = $this->query('PRAGMA table_info(tickets)');
+            try {
+                $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+            } finally {
+                $statement->closeCursor();
+            }
             $columns = [];
             foreach ($rows as $row) {
                 if (! is_string($row['name'] ?? null) || ! is_string($row['type'] ?? null) || ! is_int($row['pk'] ?? null)) {
@@ -345,19 +361,28 @@ final class LockDatabase
 
     private function assertPragmas(?float $deadline): void
     {
-        $busy = (int) $this->retryStatement(fn (): mixed => $this->query('PRAGMA busy_timeout')->fetchColumn(), $deadline);
-        $journal = mb_strtolower((string) $this->retryStatement(fn (): mixed => $this->query('PRAGMA journal_mode')->fetchColumn(), $deadline));
-        $synchronous = (int) $this->retryStatement(fn (): mixed => $this->query('PRAGMA synchronous')->fetchColumn(), $deadline);
+        $busy = (int) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA busy_timeout'), $deadline);
+        $journal = mb_strtolower((string) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA journal_mode'), $deadline));
+        $synchronous = (int) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA synchronous'), $deadline);
         if ($busy !== 0 || $journal !== 'delete' || $synchronous !== 1) {
             throw new RuntimeException('The SQLite fair lock database PRAGMA validation failed.');
         }
     }
 
     /**
+     * Retries one autocommit statement around the arm-recheck-block sequence.
+     *
+     * Only numeric SQLite BUSY or LOCKED outcomes are retryable. The operation is
+     * re-executed once immediately after arming and draining so a state change in
+     * the lost-wakeup window is observed before this owner blocks.
+     *
      * @template T
      *
-     * @param  callable(): T  $operation
-     * @return T
+     * @param  callable(): T  $operation  Complete idempotent statement unit.
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     * @return T The first successful statement result.
+     *
+     * @throws Throwable When the deadline expires or the statement fails with a non-contention outcome.
      */
     private function retryStatement(callable $operation, ?float $deadline): mixed
     {
@@ -387,10 +412,19 @@ final class LockDatabase
     }
 
     /**
+     * Executes one exclusive mutation without replaying an uncertain commit.
+     *
+     * BEGIN and pre-commit operation failures may retry only after a known rollback
+     * or a known absence of a transaction. The successful operation result returns
+     * only after commitMutation() establishes a known committed outcome.
+     *
      * @template T
      *
-     * @param  callable(PDO): T  $operation
-     * @return T
+     * @param  callable(PDO): T  $operation  Complete mutation performed inside BEGIN EXCLUSIVE.
+     * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
+     * @return T The committed mutation result.
+     *
+     * @throws Throwable When opening, mutation, rollback, commit, or waiting cannot reach a known outcome.
      */
     private function mutation(callable $operation, ?float $deadline): mixed
     {
@@ -400,20 +434,13 @@ final class LockDatabase
         while (true) {
             $this->assertBeforeDeadline($deadline);
             try {
-                $pdo->exec('BEGIN IMMEDIATE');
+                $pdo->exec('BEGIN EXCLUSIVE');
             } catch (Throwable $exception) {
                 if (! self::isBusyOrLocked($exception)) {
                     throw $exception;
                 }
-                $this->debug('lock_retry', ['operation' => 'begin_immediate']);
-                if ($secondStatecheck) {
-                    $this->waiter->block($deadline, $this->monotonic);
-                    $secondStatecheck = false;
-                } else {
-                    $this->waiter->arm();
-                    $this->waiter->drain();
-                    $secondStatecheck = true;
-                }
+                $this->debug('lock_retry', ['operation' => 'begin_exclusive']);
+                $this->waitAfterContention($deadline, $secondStatecheck);
 
                 continue;
             }
@@ -425,32 +452,21 @@ final class LockDatabase
                     $pdo->rollBack();
                     $this->debug('lock_rollback', ['operation' => 'mutation']);
                 } catch (Throwable $rollback) {
+                    $this->debug('cleanup_failed', ['operation' => 'mutation_rollback']);
                     report($rollback);
                     $this->invalidate();
                     throw $exception;
                 }
                 if (self::isBusyOrLocked($exception)) {
                     $this->debug('lock_retry', ['operation' => 'mutation']);
-                    if ($secondStatecheck) {
-                        $this->waiter->block($deadline, $this->monotonic);
-                        $secondStatecheck = false;
-                    } else {
-                        $this->waiter->arm();
-                        $this->waiter->drain();
-                        $secondStatecheck = true;
-                    }
+                    $this->waitAfterContention($deadline, $secondStatecheck);
 
                     continue;
                 }
                 throw $exception;
             }
 
-            try {
-                $pdo->commit();
-            } catch (Throwable $exception) {
-                $this->invalidate();
-                throw $exception;
-            }
+            $this->commitMutation($pdo, $deadline);
 
             return $result;
         }
@@ -463,6 +479,79 @@ final class LockDatabase
             $this->debug('wait_timeout', ['operation' => 'lock_database']);
             throw new FairWaitTimeoutException('The SQLite fair lock deadline expired.');
         }
+    }
+
+    /**
+     * Resolves the active transaction's commit without replaying its mutation.
+     *
+     * Numeric SQLite BUSY retries only PDO::commit() on the same transaction.
+     * Every other commit failure invalidates the handle because its outcome is not
+     * safe to reuse. Deadline expiry attempts one rollback before escaping.
+     */
+    private function commitMutation(PDO $pdo, ?float $deadline): void
+    {
+        $secondStatecheck = false;
+
+        try {
+            while (true) {
+                $this->assertBeforeDeadline($deadline);
+                try {
+                    $pdo->commit();
+
+                    return;
+                } catch (Throwable $exception) {
+                    if (self::sqliteResultCode($exception) !== 5) {
+                        $this->debug('unknown_pdo_outcome', ['operation' => 'lock_commit']);
+                        $this->invalidate();
+                        throw $exception;
+                    }
+
+                    $this->debug('lock_retry', ['operation' => 'commit']);
+                    $this->waitAfterContention($deadline, $secondStatecheck);
+                }
+            }
+        } catch (FairWaitTimeoutException $exception) {
+            try {
+                $pdo->rollBack();
+                $this->debug('lock_rollback', ['operation' => 'commit_timeout']);
+            } catch (Throwable $rollback) {
+                $this->debug('cleanup_failed', ['operation' => 'commit_timeout_rollback']);
+                report($rollback);
+                $this->invalidate();
+            }
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * Advances one shared arm-recheck-block contention cycle.
+     *
+     * The first call arms and drains, then returns control for the caller's second
+     * state check. A consecutive call blocks and resets the cycle.
+     */
+    private function waitAfterContention(?float $deadline, bool &$secondStatecheck): void
+    {
+        if ($secondStatecheck) {
+            $this->waiter->block($deadline, $this->monotonic);
+            $secondStatecheck = false;
+
+            return;
+        }
+
+        $this->waiter->arm();
+        $this->waiter->drain();
+        $secondStatecheck = true;
+    }
+
+    /** Returns the base SQLite result code only for PDO SQLite exceptions. */
+    private static function sqliteResultCode(Throwable $exception): ?int
+    {
+        if (! $exception instanceof PDOException || ! is_array($exception->errorInfo) || ! isset($exception->errorInfo[1])) {
+            return null;
+        }
+
+        return ((int) $exception->errorInfo[1]) & 0xFF;
     }
 
     private function invalidate(): void
@@ -504,7 +593,12 @@ final class LockDatabase
     /** @return list<string> */
     private function stringColumnNow(string $sql): array
     {
-        $values = $this->query($sql)->fetchAll(PDO::FETCH_COLUMN);
+        $statement = $this->query($sql);
+        try {
+            $values = $statement->fetchAll(PDO::FETCH_COLUMN);
+        } finally {
+            $statement->closeCursor();
+        }
         $strings = [];
         foreach ($values as $value) {
             if (! is_string($value)) {
@@ -518,12 +612,34 @@ final class LockDatabase
 
     private function queryInteger(string $sql): int
     {
-        $value = $this->query($sql)->fetchColumn();
+        $value = $this->queryValue($sql);
         if (! is_int($value) && ! is_string($value)) {
             throw new RuntimeException('The SQLite fair schema value is not numeric.');
         }
 
         return (int) $value;
+    }
+
+    /**
+     * Fetches one scalar value and always releases the SQLite read cursor.
+     *
+     * Every internal caller selects an SQLite integer, text, or null scalar. PDO
+     * returns false when the query has no row; no array, object, or floating result
+     * belongs to this lock-database query boundary.
+     *
+     * @param  string  $sql  Internal scalar query executed on the open lock PDO.
+     * @return int|string|null|false The SQLite scalar, or false when no row exists.
+     *
+     * @throws RuntimeException When the lock PDO is unavailable or the query cannot be prepared.
+     */
+    private function queryValue(string $sql): mixed
+    {
+        $statement = $this->query($sql);
+        try {
+            return $statement->fetchColumn();
+        } finally {
+            $statement->closeCursor();
+        }
     }
 
     /**
@@ -535,11 +651,11 @@ final class LockDatabase
     private function debug(string $event, array $context = []): void
     {
         if ($this->debug) {
-            Log::debug('Fair SQLite transition.', [
-                'event' => $event,
-                'pid' => getmypid(),
-                ...$context,
-            ]);
+            try {
+                Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
+            } catch (Throwable) {
+                // Optional diagnostics must never change lock ownership or retry behavior.
+            }
         }
     }
 }

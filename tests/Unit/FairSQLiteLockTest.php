@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\Log;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Lock\FairSQLiteLock;
@@ -9,7 +10,7 @@ use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
 
 it('acquires without a ticket and restores the active app busy timeout', function (int $busyTimeout) {
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/direct.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/direct.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $app->exec('PRAGMA busy_timeout='.$busyTimeout);
     $waiter = new PollingWaiter();
     $clock = static fn (): float => hrtime(true) / 1e9;
@@ -28,11 +29,13 @@ it('admits before the first app fence when queued acquisition is forced', functi
     $waiter = new PollingWaiter();
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/forced-queued-lock', $waiter, $clock);
     $state->database = $database;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-queued.sqlite', $state) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-queued.sqlite', $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             if ($statement === 'BEGIN IMMEDIATE') {
@@ -56,11 +59,13 @@ it('requeues a forced queued acquisition after fenced ownership revalidation is 
     $waiter = new PollingWaiter();
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/forced-requeue-lock', $waiter, $clock);
     $state->database = $database;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-requeue.sqlite', $state) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-requeue.sqlite', $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
@@ -88,12 +93,14 @@ it('throws the typed fair timeout after rolling back before one queued cleanup',
         $GLOBALS['sqliteFairTestRunDirectory'].'/typed-timeout-lock',
         $waiter,
         $clock,
-        static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+        static fn (string $path): PDO => new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
                 if (str_contains($query, ':ownTicket')) {
                     $this->state->events[] = 'cleanup';
@@ -103,11 +110,13 @@ it('throws the typed fair timeout after rolling back before one queued cleanup',
             }
         },
     );
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/typed-timeout.sqlite', $state) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/typed-timeout.sqlite', $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
@@ -118,6 +127,7 @@ it('throws the typed fair timeout after rolling back before one queued cleanup',
 
             return $result;
         }
+
         public function rollBack(): bool
         {
             $this->state->events[] = 'rollback';
@@ -137,15 +147,22 @@ it('throws the typed fair timeout after rolling back before one queued cleanup',
 it('throws the typed lock-owner timeout after a bounded queued wait', function () {
     $state = (object) ['now' => 0.0];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
-        public function block(?float $deadline, callable $monotonic): void { $this->state->now = 2.0; }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->now = 2.0;
+        }
     };
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/typed-lock-owner-timeout-lock', $waiter, $clock);
     $foreign = $database->admit();
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/typed-lock-owner-timeout.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/typed-lock-owner-timeout.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
 
     expect(fn () => $lock->acquireQueued(1.0))
@@ -162,12 +179,14 @@ it('does not delete a ticket when the deadline expires before admission', functi
         $GLOBALS['sqliteFairTestRunDirectory'].'/typed-pre-admission-timeout-lock',
         new PollingWaiter(),
         $clock,
-        static fn (string $path): \PDO => new class($path, $state) extends \PDO {
+        static fn (string $path): PDO => new class($path, $state) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
                 if (str_contains($query, ':ownTicket')) {
                     $this->state->deletes++;
@@ -177,7 +196,7 @@ it('does not delete a ticket when the deadline expires before admission', functi
             }
         },
     );
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/typed-pre-admission-timeout.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/typed-pre-admission-timeout.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lock = new FairSQLiteLock($app, $database, new PollingWaiter(), 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
 
     expect(fn () => $lock->acquire(1.0))
@@ -186,10 +205,12 @@ it('does not delete a ticket when the deadline expires before admission', functi
 });
 
 it('queues behind an existing ticket and cleans its own aborted ticket once', function () {
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/queued.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/queued.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $waiter = new PollingWaiter();
     $times = [0.0, 0.0, 0.2, 0.4, 0.6, 1.1];
-    $clock = static function () use (&$times): float { return array_shift($times) ?? 1.1; };
+    $clock = static function () use (&$times): float {
+        return array_shift($times) ?? 1.1;
+    };
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/queued-lock', $waiter, $clock);
     $head = $database->admit();
     $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
@@ -205,19 +226,23 @@ it('queues behind an existing ticket and cleans its own aborted ticket once', fu
 it('fails app busy-timeout read zero and restore at their exact pre-business boundary', function (string $mode) {
     $state = (object) ['mode' => $mode, 'began' => false, 'rollbacks' => 0];
     $path = $GLOBALS['sqliteFairTestRunDirectory'].'/app-timeout-'.$mode.'.sqlite';
-    $app = new class($path, $state) extends \PDO {
+    $app = new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             parent::exec('PRAGMA busy_timeout=777');
         }
-        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+
+        public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
         {
             if ($this->state->mode === 'read' && $query === 'PRAGMA busy_timeout') {
                 throw new RuntimeException('busy timeout read failure');
             }
+
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
+
         public function exec(string $statement): int|false
         {
             if ($this->state->mode === 'zero' && $statement === 'PRAGMA busy_timeout=0') {
@@ -226,19 +251,23 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
             if ($statement === 'BEGIN IMMEDIATE') {
                 $result = parent::exec($statement);
                 $this->state->began = true;
+
                 return $result;
             }
             if (str_starts_with($this->state->mode, 'restore') && $this->state->began && $statement === 'PRAGMA busy_timeout=777') {
                 throw new RuntimeException('busy timeout restore failure');
             }
+
             return parent::exec($statement);
         }
+
         public function rollBack(): bool
         {
             $this->state->rollbacks++;
             if ($this->state->mode === 'restore-unknown') {
                 throw new RuntimeException('unknown app rollback');
             }
+
             return parent::rollBack();
         }
     };
@@ -251,8 +280,12 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
         $database,
         $waiter,
         10.0,
-        static function (Throwable $e) use (&$events): void { $events[] = 'unknown'; },
-        static function () use (&$events): void { $events[] = 'disconnect'; },
+        static function (Throwable $e) use (&$events): void {
+            $events[] = 'unknown';
+        },
+        static function () use (&$events): void {
+            $events[] = 'disconnect';
+        },
         $clock,
     );
 
@@ -263,11 +296,17 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
         ->and($app->inTransaction())->toBe($mode === 'restore-unknown');
 })->with(['read', 'zero', 'restore', 'restore-unknown']);
 
-it('arms drains and performs a second full state check before blocking', function () {
+it('arms drains and rechecks the queued condition before blocking', function () {
     $state = (object) ['events' => [], 'database' => null, 'changed' => false];
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
-        public function arm(): void { $this->state->events[] = 'arm'; }
+
+        public function arm(): void
+        {
+            $this->state->events[] = 'arm';
+        }
+
         public function drain(): void
         {
             $this->state->events[] = 'drain';
@@ -276,13 +315,17 @@ it('arms drains and performs a second full state check before blocking', functio
                 $this->state->database->deleteForeignHead(1);
             }
         }
-        public function block(?float $deadline, callable $monotonic): void { $this->state->events[] = 'block'; }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->events[] = 'block';
+        }
     };
     $clock = static fn (): float => 0.0;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/second-check-lock', $waiter, $clock);
     $state->database = $database;
     expect($database->admit())->toBe(1);
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/second-check.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/second-check.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
 
     expect($lock->acquire(1.0))->toBe(2)
@@ -293,27 +336,34 @@ it('arms drains and performs a second full state check before blocking', functio
 
 it('transitions from one busy direct begin to exactly one admission before queued retry', function () {
     $path = $GLOBALS['sqliteFairTestRunDirectory'].'/app-busy-transition.sqlite';
-    $blocker = new \PDO('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $blocker = new PDO('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $blocker->exec('PRAGMA busy_timeout=0');
     $blocker->exec('BEGIN IMMEDIATE');
     $state = (object) ['begins' => 0, 'released' => false, 'beginsAtBlock' => []];
-    $app = new class($path, $state) extends \PDO {
+    $app = new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             if ($statement === 'BEGIN IMMEDIATE') {
                 $this->state->begins++;
             }
+
             return parent::exec($statement);
         }
     };
-    $waiter = new class($blocker, $state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
-        public function __construct(private \PDO $blocker, private object $state) {}
+    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
+        public function __construct(private PDO $blocker, private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void
         {
             $this->state->beginsAtBlock[] = $this->state->begins;
@@ -343,29 +393,39 @@ it('rolls back before cleaning one owned ticket and marks unknown outcome before
         $GLOBALS['sqliteFairTestRunDirectory'].'/abort-owned-'.($unknown ? 'unknown' : 'known'),
         $waiter,
         $clock,
-        static fn (string $path): \PDO => new class($path, $lockState) extends \PDO {
+        static fn (string $path): PDO => new class($path, $lockState) extends PDO
+        {
             public function __construct(string $path, private object $state)
             {
-                parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
-                if (str_starts_with($query, 'DELETE FROM tickets')) { $this->state->deletes++; }
+                if (str_starts_with($query, 'DELETE FROM tickets')) {
+                    $this->state->deletes++;
+                }
+
                 return parent::prepare($query, $options);
             }
         },
     );
     expect($database->admit())->toBe(1);
     $appState = (object) ['rollbacks' => 0];
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/abort-owned.sqlite', $appState, $unknown) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/abort-owned.sqlite', $appState, $unknown) extends PDO
+    {
         public function __construct(string $path, private object $state, private bool $unknown)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function rollBack(): bool
         {
             $this->state->rollbacks++;
-            if ($this->unknown) { throw new RuntimeException('unknown rollback'); }
+            if ($this->unknown) {
+                throw new RuntimeException('unknown rollback');
+            }
+
             return parent::rollBack();
         }
     };
@@ -376,8 +436,12 @@ it('rolls back before cleaning one owned ticket and marks unknown outcome before
         $database,
         $waiter,
         10.0,
-        static function (Throwable $e) use (&$events): void { $events[] = 'unknown'; },
-        static function () use (&$events): void { $events[] = 'disconnect'; },
+        static function (Throwable $e) use (&$events): void {
+            $events[] = 'unknown';
+        },
+        static function () use (&$events): void {
+            $events[] = 'disconnect';
+        },
         $clock,
     );
 
@@ -391,26 +455,37 @@ it('rolls back before cleaning one owned ticket and marks unknown outcome before
 it('keeps a foreign non-head off the app fence below stale threshold then recovers fenced', function () {
     $state = (object) ['now' => 0.0, 'begins' => 0, 'below' => [], 'loops' => 0];
     $clock = static fn (): float => $state->now;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/stale-count.sqlite', $state) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/stale-count.sqlite', $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
-            if ($statement === 'BEGIN IMMEDIATE') { $this->state->begins++; }
+            if ($statement === 'BEGIN IMMEDIATE') {
+                $this->state->begins++;
+            }
+
             return parent::exec($statement);
         }
     };
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void
         {
             $this->state->below[] = $this->state->begins;
             $this->state->loops++;
-            $this->state->now = match ($this->state->loops) { 1 => 0.2, 2 => 0.4, default => 2.0 };
+            $this->state->now = match ($this->state->loops) {
+                1 => 0.2, 2 => 0.4, default => 2.0
+            };
         }
     };
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/stale-count-lock', $waiter, $clock);
@@ -426,32 +501,42 @@ it('keeps a foreign non-head off the app fence below stale threshold then recove
 
 it('restores busy timeout after direct busy and cleans admission on permanent queued begin', function () {
     $path = $GLOBALS['sqliteFairTestRunDirectory'].'/queued-permanent.sqlite';
-    $blocker = new \PDO('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $blocker = new PDO('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $blocker->exec('BEGIN IMMEDIATE');
     $state = (object) ['begins' => 0, 'released' => false, 'deadlines' => [], 'blocks' => 0];
-    $app = new class($path, $state) extends \PDO {
+    $app = new class($path, $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             parent::exec('PRAGMA busy_timeout=2468');
         }
+
         public function exec(string $statement): int|false
         {
             if ($statement === 'BEGIN IMMEDIATE' && ++$this->state->begins === 2) {
                 throw new RuntimeException('permanent queued begin');
             }
+
             return parent::exec($statement);
         }
     };
-    $waiter = new class($blocker, $state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
-        public function __construct(private \PDO $blocker, private object $state) {}
+    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
+        public function __construct(private PDO $blocker, private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void
         {
             $this->state->blocks++;
             $this->state->deadlines[] = $deadline;
-            if (! $this->state->released) { $this->blocker->rollBack(); $this->state->released = true; }
+            if (! $this->state->released) {
+                $this->blocker->rollBack();
+                $this->state->released = true;
+            }
         }
     };
     $clock = static fn (): float => 10.0;
@@ -468,9 +553,12 @@ it('restores busy timeout after direct busy and cleans admission on permanent qu
 
 it('never attempts an app fence while behind two or three committed foreign tickets', function (int $foreignTickets) {
     $state = (object) ['begins' => 0, 'database' => null, 'deleted' => 0];
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void
         {
             $head = $this->state->database->readHead();
@@ -480,6 +568,7 @@ it('never attempts an app fence while behind two or three committed foreign tick
                 $this->state->deleted++;
             }
         }
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
     $state->foreignTickets = $foreignTickets;
@@ -489,14 +578,19 @@ it('never attempts an app fence while behind two or three committed foreign tick
     for ($ticket = 1; $ticket <= $foreignTickets; $ticket++) {
         expect($database->admit())->toBe($ticket);
     }
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/non-head-'.$foreignTickets.'.sqlite', $state) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/non-head-'.$foreignTickets.'.sqlite', $state) extends PDO
+    {
         public function __construct(string $path, private object $state)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
-            if ($statement === 'BEGIN IMMEDIATE') { $this->state->begins++; }
+            if ($statement === 'BEGIN IMMEDIATE') {
+                $this->state->begins++;
+            }
+
             return parent::exec($statement);
         }
     };
@@ -512,9 +606,12 @@ it('never attempts an app fence while behind two or three committed foreign tick
 
 it('rolls back and requeues with a higher ticket when under-fence ownership is missing or foreign', function (string $replacement) {
     $state = (object) ['database' => null, 'begins' => 0, 'removedInitial' => false, 'removedReplacement' => false];
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void
         {
             $head = $this->state->database->readHead();
@@ -526,24 +623,30 @@ it('rolls back and requeues with a higher ticket when under-fence ownership is m
                 $this->state->removedReplacement = true;
             }
         }
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
     $clock = static fn (): float => 0.0;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/under-fence-'.$replacement, $waiter, $clock);
     $state->database = $database;
     expect($database->admit())->toBe(1);
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/under-fence-'.$replacement.'.sqlite', $state, $replacement) extends \PDO {
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/under-fence-'.$replacement.'.sqlite', $state, $replacement) extends PDO
+    {
         public function __construct(string $path, private object $state, private string $replacement)
         {
-            parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
             if ($statement === 'BEGIN IMMEDIATE' && ++$this->state->begins === 1) {
                 $this->state->database->deleteExact(2);
-                if ($this->replacement === 'foreign') { expect($this->state->database->admit())->toBe(3); }
+                if ($this->replacement === 'foreign') {
+                    expect($this->state->database->admit())->toBe(3);
+                }
             }
+
             return $result;
         }
     };
@@ -558,24 +661,41 @@ it('rolls back and requeues with a higher ticket when under-fence ownership is m
 
 it('switches to queued ownership when a ticket appears between the two direct reads', function () {
     $state = (object) ['database' => null, 'injected' => false, 'pending' => false];
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void
         {
-            if ($this->state->pending) { $this->state->database->deleteForeignHead(1); $this->state->pending = false; }
+            if ($this->state->pending) {
+                $this->state->database->deleteForeignHead(1);
+                $this->state->pending = false;
+            }
         }
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
     $clock = static fn (): float => 0.0;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/between-reads-lock', $waiter, $clock);
     $state->database = $database;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/between-reads.sqlite', $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/between-reads.sqlite', $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
-            if ($statement === 'BEGIN IMMEDIATE' && ! $this->state->injected) { $this->state->database->admit(); $this->state->injected = true; $this->state->pending = true; }
+            if ($statement === 'BEGIN IMMEDIATE' && ! $this->state->injected) {
+                $this->state->database->admit();
+                $this->state->injected = true;
+                $this->state->pending = true;
+            }
+
             return $result;
         }
     };
@@ -592,18 +712,35 @@ it('does not replay an unknown direct-fence rollback after the second head read 
     $waiter = new PollingWaiter();
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/direct-rollback-unknown-lock', $waiter, $clock);
     $state->database = $database;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/direct-rollback-unknown.sqlite', $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/direct-rollback-unknown.sqlite', $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
-            if ($statement === 'BEGIN IMMEDIATE') { $this->state->database->admit(); }
+            if ($statement === 'BEGIN IMMEDIATE') {
+                $this->state->database->admit();
+            }
+
             return $result;
         }
-        public function rollBack(): bool { $this->state->rollbacks++; throw new RuntimeException('unknown direct rollback'); }
+
+        public function rollBack(): bool
+        {
+            $this->state->rollbacks++;
+            throw new RuntimeException('unknown direct rollback');
+        }
     };
     $events = [];
-    $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e) use (&$events): void { $events[] = 'unknown'; }, static function () use (&$events): void { $events[] = 'disconnect'; }, $clock);
+    $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e) use (&$events): void {
+        $events[] = 'unknown';
+    }, static function () use (&$events): void {
+        $events[] = 'disconnect';
+    }, $clock);
 
     expect(fn () => $lock->acquire())->toThrow(RuntimeException::class, 'unknown direct rollback')
         ->and($state->rollbacks)->toBe(1)
@@ -614,26 +751,70 @@ it('does not replay an unknown direct-fence rollback after the second head read 
 
 it('does not replay unknown queued revalidation rollback and cleans its own ticket once', function () {
     $state = (object) ['database' => null, 'deletedForeign' => false, 'deletes' => 0, 'rollbacks' => 0];
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
-        public function drain(): void { if (! $this->state->deletedForeign) { $this->state->database->deleteForeignHead(1); $this->state->deletedForeign = true; } }
+
+        public function drain(): void
+        {
+            if (! $this->state->deletedForeign) {
+                $this->state->database->deleteForeignHead(1);
+                $this->state->deletedForeign = true;
+            }
+        }
+
         public function block(?float $deadline, callable $monotonic): void {}
     };
     $clock = static fn (): float => 0.0;
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/queued-rollback-unknown-lock', $waiter, $clock, static fn (string $path): \PDO => new class($path, $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function prepare(string $query, array $options = []): \PDOStatement|false { if (str_starts_with($query, 'DELETE FROM tickets')) { $this->state->deletes++; } return parent::prepare($query, $options); }
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/queued-rollback-unknown-lock', $waiter, $clock, static fn (string $path): PDO => new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function prepare(string $query, array $options = []): PDOStatement|false
+        {
+            if (str_starts_with($query, 'DELETE FROM tickets')) {
+                $this->state->deletes++;
+            }
+
+            return parent::prepare($query, $options);
+        }
     });
     $state->database = $database;
     $database->admit();
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/queued-rollback-unknown.sqlite', $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function exec(string $statement): int|false { $result = parent::exec($statement); if ($statement === 'BEGIN IMMEDIATE') { $this->state->database->deleteExact(2); } return $result; }
-        public function rollBack(): bool { $this->state->rollbacks++; throw new RuntimeException('unknown queued rollback'); }
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/queued-rollback-unknown.sqlite', $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function exec(string $statement): int|false
+        {
+            $result = parent::exec($statement);
+            if ($statement === 'BEGIN IMMEDIATE') {
+                $this->state->database->deleteExact(2);
+            }
+
+            return $result;
+        }
+
+        public function rollBack(): bool
+        {
+            $this->state->rollbacks++;
+            throw new RuntimeException('unknown queued rollback');
+        }
     };
     $events = [];
-    $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e) use (&$events): void { $events[] = 'unknown'; }, static function () use (&$events): void { $events[] = 'disconnect'; }, $clock);
+    $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e) use (&$events): void {
+        $events[] = 'unknown';
+    }, static function () use (&$events): void {
+        $events[] = 'disconnect';
+    }, $clock);
 
     expect(fn () => $lock->acquire())->toThrow(RuntimeException::class, 'unknown queued rollback')
         ->and($state->rollbacks)->toBe(1)
@@ -650,17 +831,25 @@ it('linearizes ticketless ownership when a ticket appears after the second direc
         $GLOBALS['sqliteFairTestRunDirectory'].'/after-reads-lock',
         $waiter,
         $clock,
-        static fn (string $path): \PDO => new class($path, $state) extends \PDO {
-            public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+        static fn (string $path): PDO => new class($path, $state) extends PDO
+        {
+            public function __construct(string $path, private object $state)
+            {
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            }
+
+            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
             {
                 $statement = $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
-                if (str_starts_with($query, 'SELECT ticket') && ++$this->state->headReads === 2) { parent::exec('INSERT INTO tickets DEFAULT VALUES'); }
+                if (str_starts_with($query, 'SELECT ticket') && ++$this->state->headReads === 2) {
+                    parent::exec('INSERT INTO tickets DEFAULT VALUES');
+                }
+
                 return $statement;
             }
         },
     );
-    $app = new \PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/after-reads.sqlite', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/after-reads.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
 
     expect($lock->acquire())->toBeNull()
@@ -671,38 +860,61 @@ it('linearizes ticketless ownership when a ticket appears after the second direc
 
 it('propagates one absolute deadline unchanged through lock database and fair waiter blocks', function () {
     $path = $GLOBALS['sqliteFairTestRunDirectory'].'/queued-repeat.sqlite';
-    $blocker = new \PDO('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $blocker = new PDO('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $blocker->exec('BEGIN IMMEDIATE');
     $state = (object) ['now' => 10.0, 'headFailures' => 0, 'begins' => 0, 'blocks' => 0, 'deadlines' => [], 'beginsAtBlock' => []];
-    $app = new class($path, $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); parent::exec('PRAGMA busy_timeout=9999'); }
-        public function exec(string $statement): int|false { if ($statement === 'BEGIN IMMEDIATE') { $this->state->begins++; } return parent::exec($statement); }
+    $app = new class($path, $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            parent::exec('PRAGMA busy_timeout=9999');
+        }
+
+        public function exec(string $statement): int|false
+        {
+            if ($statement === 'BEGIN IMMEDIATE') {
+                $this->state->begins++;
+            }
+
+            return parent::exec($statement);
+        }
     };
-    $waiter = new class($blocker, $state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
-        public function __construct(private \PDO $blocker, private object $state) {}
+    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
+        public function __construct(private PDO $blocker, private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void
         {
             $this->state->beginsAtBlock[] = $this->state->begins;
             $this->state->deadlines[] = $deadline;
-            if (++$this->state->blocks === 2) { $this->blocker->rollBack(); }
+            if (++$this->state->blocks === 2) {
+                $this->blocker->rollBack();
+            }
         }
     };
-    $clock = static function () use ($state): float { return $state->now += 0.01; };
+    $clock = static function () use ($state): float {
+        return $state->now += 0.01;
+    };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/queued-repeat-lock',
         $waiter,
         $clock,
-        static fn (string $lockPath): \PDO => new class($lockPath, $state) extends \PDO {
+        static fn (string $lockPath): PDO => new class($lockPath, $state) extends PDO
+        {
             public function __construct(string $lockPath, private object $state)
             {
-                parent::__construct('sqlite:'.$lockPath, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+                parent::__construct('sqlite:'.$lockPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             }
-            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+
+            public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
             {
                 if (str_starts_with($query, 'SELECT ticket') && $this->state->headFailures++ < 2) {
-                    $exception = new \PDOException('busy absolute-deadline head read');
+                    $exception = new PDOException('busy absolute-deadline head read');
                     $exception->errorInfo = ['HY000', 5, 'ignored'];
 
                     throw $exception;
@@ -728,36 +940,66 @@ it('propagates one absolute deadline unchanged through lock database and fair wa
 it('keeps recovery primary errors and cleans one own ticket after unknown fence rollback', function (string $mode) {
     $state = (object) ['now' => 0.0, 'foreignAttempts' => 0, 'ownCleanups' => 0, 'rollbacks' => 0];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
-        public function block(?float $deadline, callable $monotonic): void { $this->state->now = 2.0; }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            $this->state->now = 2.0;
+        }
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/recovery-rollback-'.$mode,
         $waiter,
         $clock,
-        static fn (string $path): \PDO => new class($path, $state, $mode) extends \PDO {
-            public function __construct(string $path, private object $state, private string $mode) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-            public function prepare(string $query, array $options = []): \PDOStatement|false
+        static fn (string $path): PDO => new class($path, $state, $mode) extends PDO
+        {
+            public function __construct(string $path, private object $state, private string $mode)
+            {
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            }
+
+            public function prepare(string $query, array $options = []): PDOStatement|false
             {
                 if (str_contains($query, ':observedForeignHead')) {
                     $this->state->foreignAttempts++;
-                    if ($this->mode === 'lock-error') { throw new RuntimeException('primary foreign delete'); }
+                    if ($this->mode === 'lock-error') {
+                        throw new RuntimeException('primary foreign delete');
+                    }
                 }
-                if (str_contains($query, ':ownTicket')) { $this->state->ownCleanups++; }
+                if (str_contains($query, ':ownTicket')) {
+                    $this->state->ownCleanups++;
+                }
+
                 return parent::prepare($query, $options);
             }
         },
     );
     expect($database->admit())->toBe(1);
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/recovery-rollback-'.$mode.'.sqlite', $state) extends \PDO {
-        public function __construct(string $path, private object $state) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
-        public function rollBack(): bool { $this->state->rollbacks++; throw new RuntimeException('unknown recovery rollback'); }
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/recovery-rollback-'.$mode.'.sqlite', $state) extends PDO
+    {
+        public function __construct(string $path, private object $state)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
+        public function rollBack(): bool
+        {
+            $this->state->rollbacks++;
+            throw new RuntimeException('unknown recovery rollback');
+        }
     };
     $events = [];
-    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $e) use (&$events): void { $events[] = 'unknown'; }, static function () use (&$events): void { $events[] = 'disconnect'; }, $clock);
+    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $e) use (&$events): void {
+        $events[] = 'unknown';
+    }, static function () use (&$events): void {
+        $events[] = 'disconnect';
+    }, $clock);
     $expectedPrimary = $mode === 'lock-error' ? 'primary foreign delete' : 'unknown recovery rollback';
 
     expect(fn () => $lock->acquire())->toThrow(RuntimeException::class, $expectedPrimary)
@@ -769,12 +1011,25 @@ it('keeps recovery primary errors and cleans one own ticket after unknown fence 
 })->with(['lock-error', 'success']);
 
 it('resets stale observation when fenced revalidation changes or vanishes', function (string $revalidation) {
+    Log::spy();
+    $loggedRecoveryHeads = [];
+    Log::shouldReceive('debug')->zeroOrMoreTimes()->andReturnUsing(
+        static function (string $message, array $context) use (&$loggedRecoveryHeads): void {
+            if ($message === 'Fair SQLite transition.' && ($context['event'] ?? null) === 'stale_head_recovered') {
+                $loggedRecoveryHeads[] = $context['head_ticket'] ?? null;
+            }
+        },
+    );
     $state = (object) ['now' => 0.0, 'begins' => 0, 'blocks' => 0, 'beginsAtBlock' => [], 'database' => null];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements \RunYourApp\LaravelSqliteFair\Wait\Waiter {
+    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    {
         public function __construct(private object $state) {}
+
         public function arm(): void {}
+
         public function drain(): void {}
+
         public function block(?float $deadline, callable $monotonic): void
         {
             $this->state->beginsAtBlock[] = $this->state->begins;
@@ -784,26 +1039,37 @@ it('resets stale observation when fenced revalidation changes or vanishes', func
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/revalidation-'.$revalidation, $waiter, $clock);
     $state->database = $database;
     $database->admit();
-    if ($revalidation === 'changed') { $database->admit(); }
+    if ($revalidation === 'changed') {
+        $database->admit();
+    }
     $ownTicket = $revalidation === 'changed' ? 3 : 2;
-    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/revalidation-'.$revalidation.'.sqlite', $state, $revalidation, $ownTicket) extends \PDO {
-        public function __construct(string $path, private object $state, private string $revalidation, private int $ownTicket) { parent::__construct('sqlite:'.$path, options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]); }
+    $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/revalidation-'.$revalidation.'.sqlite', $state, $revalidation, $ownTicket) extends PDO
+    {
+        public function __construct(string $path, private object $state, private string $revalidation, private int $ownTicket)
+        {
+            parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        }
+
         public function exec(string $statement): int|false
         {
             $result = parent::exec($statement);
             if ($statement === 'BEGIN IMMEDIATE' && ++$this->state->begins === 1) {
                 $this->state->database->deleteForeignHead(1);
-                if ($this->revalidation === 'vanished') { $this->state->database->deleteExact($this->ownTicket); }
+                if ($this->revalidation === 'vanished') {
+                    $this->state->database->deleteExact($this->ownTicket);
+                }
             }
+
             return $result;
         }
     };
-    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
+    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $e): void {}, static function (): void {}, $clock, true);
     $returned = $lock->acquire();
 
     expect($state->beginsAtBlock)->toBe($revalidation === 'changed' ? [0, 1] : [0])
         ->and($returned)->toBe($revalidation === 'changed' ? 3 : 3)
         ->and($state->begins)->toBe($revalidation === 'changed' ? 3 : 2);
+    expect($loggedRecoveryHeads)->not->toContain(1);
     $app->rollBack();
     $database->deleteExact($returned);
 })->with(['changed', 'vanished']);

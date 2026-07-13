@@ -28,7 +28,7 @@ final class WaiterFactory
      * @param  string|null  $osFamily  PHP operating-system family, or null for the active host.
      * @param  bool|null  $inotify  Test override for Linux Inotify availability.
      * @param  bool|null  $ffi  Test override for Darwin kqueue availability.
-     * @return array{platform: 'linux'|'darwin'|'windows'|'unsupported', native_available: bool}
+     * @return array{platform: 'linux'|'darwin'|'windows'|'unsupported', native_available: bool} Normalized host policy and its native-adapter availability.
      *
      * @internal Package tests and runtime capability checks use this deterministic matrix.
      */
@@ -62,12 +62,13 @@ final class WaiterFactory
      *
      * @param  'auto'|'native'|'polling'|string  $strategy  Requested wait policy.
      * @param  string  $directory  Existing absolute lock directory observed by native adapters.
-     * @return Waiter
+     * @param  bool  $debug  Whether abnormal adapter transitions emit structured debug logs.
+     * @return Waiter The selected and fully initialized wait adapter.
      *
      * @throws InvalidArgumentException When the strategy is not supported.
      * @throws RuntimeException When the host lacks the requested native capability or adapter startup fails.
      */
-    public static function make(string $strategy, string $directory): Waiter
+    public static function make(string $strategy, string $directory, bool $debug = false): Waiter
     {
         if ($strategy === 'polling') {
             return new PollingWaiter();
@@ -89,8 +90,8 @@ final class WaiterFactory
         }
 
         return match ($capabilities['platform']) {
-            'linux' => new InotifyWaiter($directory, $strategy === 'auto'),
-            'darwin' => new KqueueWaiter($directory, $strategy === 'auto'),
+            'linux' => new InotifyWaiter($directory, $strategy === 'auto', debug: $debug),
+            'darwin' => new KqueueWaiter($directory, $strategy === 'auto', debug: $debug),
             default => throw new RuntimeException('The current operating system has no supported wait strategy.'),
         };
     }

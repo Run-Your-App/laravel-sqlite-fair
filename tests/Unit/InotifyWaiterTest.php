@@ -46,3 +46,26 @@ it('degrades only auto after a post-arm inotify failure', function (bool $auto) 
         expect(fn () => $waiter->arm())->toThrow(RuntimeException::class);
     }
 })->with([true, false]);
+
+it('returns to the lock state check immediately after an automatic block degradation', function () {
+    if (PHP_OS_FAMILY !== 'Linux') {
+        $this->markTestSkipped('The deterministic inotify failure proof belongs to Linux hosts.');
+    }
+
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/inotify-block-degradation';
+    mkdir($directory, 0775, true);
+    $monotonicCalls = 0;
+    $waiter = new InotifyWaiter(
+        $directory,
+        true,
+        static fn (array &$read, array &$write, array &$except, int $seconds, int $microseconds): false => false,
+    );
+
+    $waiter->block(1.0, static function () use (&$monotonicCalls): float {
+        $monotonicCalls++;
+
+        return 0.0;
+    });
+
+    expect($monotonicCalls)->toBe(1);
+});

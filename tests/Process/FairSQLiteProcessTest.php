@@ -7,7 +7,7 @@ use RunYourApp\LaravelSqliteFair\Tests\Support\ProcessHarness;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
 
 it('uses one fixed child workspace and the package autoloader', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
         expect($workspace)->toEndWith('/workspaces/sqlite-fair-process')
             ->and($harness->autoloadPath())->toBe(dirname(__DIR__, 2).'/vendor/autoload.php');
@@ -15,7 +15,7 @@ it('uses one fixed child workspace and the package autoloader', function () {
 });
 
 it('boots concurrent children only through the package autoloader and fixed workspace', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
         $results = $harness->runChildren([
             ['scenario' => 'boot'],
@@ -28,12 +28,36 @@ it('boots concurrent children only through the package autoloader and fixed work
     });
 });
 
+it('fails a blocked child at the harness deadline with its scenario name', function () {
+    $harness = new ProcessHarness;
+    $harness->run(function () use ($harness): void {
+        expect(fn (): array => $harness->runChildren(
+            [['scenario' => 'wait-for-missing-signal']],
+            0.05,
+        ))->toThrow(RuntimeException::class, 'wait-for-missing-signal');
+    });
+});
+
+it('wakes a registered process barrier through its persisted sqlite signal', function () {
+    $harness = new ProcessHarness;
+    $harness->run(function () use ($harness): void {
+        $results = $harness->runChildren([
+            ['scenario' => 'signal-waiter'],
+            ['scenario' => 'signal-sender'],
+        ]);
+
+        expect(array_column($results, 'exit_code'))->toBe([0, 0], implode(PHP_EOL, array_column($results, 'stderr')))
+            ->and($results[0]['stdout'])->toBe('notified')
+            ->and($results[1]['stdout'])->toBe('sent');
+    });
+});
+
 it('waits before a ticket mutation while another process holds a lock database read transaction', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
         $database = new LockDatabase(
             $workspace.'/locks',
-            new PollingWaiter(),
+            new PollingWaiter,
             static fn (): float => hrtime(true) / 1e9,
         );
         expect($database->admit())->toBe(1);
@@ -49,11 +73,13 @@ it('waits before a ticket mutation while another process holds a lock database r
 });
 
 it('keeps concurrent writers mutually exclusive and makes progress without notification events', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
+        $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $app->exec('CREATE TABLE mutual_writes (label TEXT NOT NULL UNIQUE)');
         $results = $harness->runChildren([
-            ['scenario' => 'mutual-writer', 'arguments' => ['label' => 'one']],
-            ['scenario' => 'mutual-writer', 'arguments' => ['label' => 'two']],
+            ['scenario' => 'mutual-writer', 'arguments' => ['role' => 'holder', 'label' => 'one']],
+            ['scenario' => 'mutual-writer', 'arguments' => ['role' => 'contender', 'label' => 'two']],
         ]);
 
         $failureOutput = array_map(
@@ -68,13 +94,19 @@ it('keeps concurrent writers mutually exclusive and makes progress without notif
             ->and(str_starts_with($events[1], 'exit:'))->toBeTrue()
             ->and(str_starts_with($events[2], 'enter:'))->toBeTrue()
             ->and(str_starts_with($events[3], 'exit:'))->toBeTrue();
+        $labels = $app->query('SELECT label FROM mutual_writes ORDER BY label')->fetchAll(PDO::FETCH_COLUMN);
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter(), static fn (): float => 0.0);
+        $coordination = new PDO('sqlite:'.$workspace.'/coordination.sqlite');
+        expect($labels)->toBe(['one', 'two'])
+            ->and($coordination->query("SELECT value FROM signals WHERE name = 'mutual-contender-queued'")->fetchColumn())->toBe('1')
+            ->and($database->readHead())->toBeNull();
     });
 });
 
 it('recovers a stale committed head under an app fence and preserves progress', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
-        $database = new LockDatabase($workspace.'/locks', new PollingWaiter(), static fn (): float => 0.0);
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter, static fn (): float => 0.0);
         $stale = $database->admit();
         $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $app->exec('CREATE TABLE writes (value TEXT NOT NULL)');
@@ -87,9 +119,32 @@ it('recovers a stale committed head under an app fence and preserves progress', 
     });
 });
 
-it('rolls back a crashed pre-commit writer and lets a concurrent follower commit', function () {
-    $harness = new ProcessHarness();
+it('lets two concurrent followers recover one stale head and each commit once', function () {
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter, static fn (): float => 0.0);
+        expect($database->admit())->toBe(1);
+        $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $app->exec('CREATE TABLE writes (value TEXT NOT NULL UNIQUE)');
+        $results = $harness->runChildren([
+            ['scenario' => 'stale-recovery', 'arguments' => ['label' => 'recoverer-one', 'peer' => 'recoverer-two']],
+            ['scenario' => 'stale-recovery', 'arguments' => ['label' => 'recoverer-two', 'peer' => 'recoverer-one']],
+        ]);
+
+        $coordination = new PDO('sqlite:'.$workspace.'/coordination.sqlite');
+        expect(array_column($results, 'exit_code'))->toBe([0, 0], implode(PHP_EOL, array_column($results, 'stderr')))
+            ->and($database->readHead())->toBeNull()
+            ->and($coordination->query("SELECT COUNT(*) FROM signals WHERE name IN ('stale-observed-recoverer-one', 'stale-observed-recoverer-two')")->fetchColumn())->toBe(2)
+            ->and($app->query('SELECT value FROM writes ORDER BY value')->fetchAll(PDO::FETCH_COLUMN))
+            ->toBe(['recoverer-one', 'recoverer-two']);
+    });
+});
+
+it('rolls back a crashed pre-commit writer and lets a concurrent follower commit', function () {
+    $harness = new ProcessHarness;
+    $harness->run(function (string $workspace) use ($harness): void {
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter, static fn (): float => 0.0);
+        expect($database->admit())->toBe(1);
         $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $app->exec('CREATE TABLE writes (value TEXT NOT NULL)');
         $results = $harness->runChildren([
@@ -98,15 +153,18 @@ it('rolls back a crashed pre-commit writer and lets a concurrent follower commit
         ]);
 
         expect(array_column($results, 'exit_code'))->toBe([23, 0], mb_substr($results[1]['stderr'], 0, 2000))
-            ->and($app->query('SELECT value FROM writes')->fetchAll(PDO::FETCH_COLUMN))->toBe(['follower']);
+            ->and($app->query('SELECT value FROM writes')->fetchAll(PDO::FETCH_COLUMN))->toBe(['follower'])
+            ->and($database->readHead())->toBeNull();
     });
 });
 
 it('requeues a reclaimed owner with a higher committed ticket', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
-        $database = new LockDatabase($workspace.'/locks', new PollingWaiter(), static fn (): float => 0.0);
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter, static fn (): float => 0.0);
         expect($database->admit())->toBe(1);
+        $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $app->exec('CREATE TABLE reclaimed_writes (value TEXT NOT NULL UNIQUE)');
         $results = $harness->runChildren([
             ['scenario' => 'reclaimed-ticket', 'arguments' => ['role' => 'acquirer']],
             ['scenario' => 'reclaimed-ticket', 'arguments' => ['role' => 'reclaimer']],
@@ -116,14 +174,15 @@ it('requeues a reclaimed owner with a higher committed ticket', function () {
         expect(array_column($results, 'exit_code'))->toBe([0, 0], implode(PHP_EOL, array_column($results, 'stderr')))
             ->and($coordination->query("SELECT value FROM signals WHERE name = 'reclaimed'")->fetchColumn())->toBe('2')
             ->and($results[0]['stdout'])->toBe('3')
+            ->and($app->query('SELECT value FROM reclaimed_writes')->fetchColumn())->toBe('acquired')
             ->and($database->readHead())->toBeNull();
     });
 });
 
 it('preserves a committed write when its owner crashes before ticket cleanup and recovers progress', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
-        $database = new LockDatabase($workspace.'/locks', new PollingWaiter(), static fn (): float => 0.0);
+        $database = new LockDatabase($workspace.'/locks', new PollingWaiter, static fn (): float => 0.0);
         $database->admit();
         $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $app->exec('CREATE TABLE writes (value TEXT NOT NULL)');
@@ -140,7 +199,7 @@ it('preserves a committed write when its owner crashes before ticket cleanup and
 });
 
 it('acquires three committed non-reclaimed tickets in fifo order', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function (string $workspace) use ($harness): void {
         $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $app->exec('CREATE TABLE fifo (label TEXT NOT NULL, ticket INTEGER NOT NULL)');
@@ -158,7 +217,7 @@ it('acquires three committed non-reclaimed tickets in fifo order', function () {
 });
 
 it('retires an unknown app commit identity and releases the app pdo after stack unwind', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function () use ($harness): void {
         $result = $harness->runChildren([['scenario' => 'unknown-commit']])[0];
 
@@ -169,7 +228,7 @@ it('retires an unknown app commit identity and releases the app pdo after stack 
 });
 
 it('isolates every unknown rollback outcome without finalizing laravel state', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function () use ($harness): void {
         $modes = ['full', 'savepoint', 'nontransactional'];
         $results = $harness->runChildren(array_map(
@@ -183,7 +242,7 @@ it('isolates every unknown rollback outcome without finalizing laravel state', f
 });
 
 it('preserves the original pre-business error when unknown rollback cleanup also fails once', function () {
-    $harness = new ProcessHarness();
+    $harness = new ProcessHarness;
     $harness->run(function () use ($harness): void {
         $result = $harness->runChildren([['scenario' => 'cleanup-failure']])[0];
 

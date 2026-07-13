@@ -5,9 +5,9 @@ declare(strict_types=1);
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Database\DatabaseTransactionsManager;
+use Illuminate\Support\Facades\Facade;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteConnection;
-use RunYourApp\LaravelSqliteFair\Lock\FairSQLiteLock;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
@@ -29,8 +29,11 @@ match ($scenario) {
     'lock-reader' => holdLockDatabaseRead($workspace),
     'ticket-mutator' => deleteTicketAfterReaderReleases($workspace),
     'boot' => print $workspace,
+    'wait-for-missing-signal' => waitForSignal($workspace, 'never-signalled', 30.0),
+    'signal-waiter' => runSignalWaiter($workspace),
+    'signal-sender' => runSignalSender($workspace),
     'mutual-writer' => runMutualWriter($workspace, $arguments),
-    'stale-recovery' => runStaleRecovery($workspace),
+    'stale-recovery' => runStaleRecovery($workspace, $arguments),
     'pre-commit-crash' => runPreCommitCrash($workspace, $arguments),
     'reclaimed-ticket' => runReclaimedTicket($workspace, $arguments),
     'committed-crash' => runCommittedCrash($workspace, $arguments),
@@ -107,86 +110,158 @@ function deleteTicketAfterReaderReleases(string $workspace): void
     }
 }
 
-/** Waits briefly without using wall-clock sleep calls. */
-function pauseChild(): void
-{
-    static $waiter;
-    $waiter ??= new PollingWaiter();
-    $clock = static fn (): float => hrtime(true) / 1e9;
-    $waiter->block($clock() + 0.01, $clock);
+/**
+ * Creates the real Laravel connection used by process-level writer scenarios.
+ *
+ * @param  string  $workspace  Shared process-test workspace containing the application and lock databases.
+ * @param  string  $name  Child-local Laravel connection name used in the fair identity.
+ * @param  float  $staleHeadSeconds  Monotonic age required before a foreign head is fenced and removed.
+ * @param  (Closure(): float)|null  $monotonic  Optional deterministic clock for stale-recovery scenarios.
+ * @param  PDO|null  $pdo  Optional fault-injecting application PDO used by crash-boundary scenarios.
+ * @param  string|null  $ticketCreatedSignal  Optional persisted barrier emitted by the production debug transition.
+ */
+function fairConnection(
+    string $workspace,
+    string $name,
+    float $staleHeadSeconds = 1.0,
+    ?Closure $monotonic = null,
+    ?PDO $pdo = null,
+    ?string $ticketCreatedSignal = null,
+): FairSQLiteConnection {
+    $appPath = $workspace.'/app.sqlite';
+    $lockPath = $workspace.'/locks';
+    $pdo ??= new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $config = [
+        'driver' => 'fair-sqlite',
+        'name' => $name,
+        'database' => $appPath,
+        'prefix' => '',
+        'lock_directory' => $lockPath,
+        'stale_head_seconds' => $staleHeadSeconds,
+        'wait_strategy' => 'polling',
+        'debug' => $ticketCreatedSignal !== null,
+    ];
+
+    if ($ticketCreatedSignal !== null) {
+        installTicketSignalLogger($workspace, $ticketCreatedSignal);
+    }
+
+    return new FairSQLiteConnection($pdo, $appPath, '', $config, $appPath, $lockPath, $monotonic);
 }
 
-/** @return array{LockDatabase, PDO, FairSQLiteLock, Closure(): float} */
-function fairRuntime(string $workspace, float $staleHeadSeconds = 1.0): array
+/** Installs a child-local logger that converts the real ticket transition into a SQLite barrier. */
+function installTicketSignalLogger(string $workspace, string $ticketCreatedSignal): void
 {
-    $clock = static fn (): float => hrtime(true) / 1e9;
-    $waiter = new PollingWaiter();
-    $database = new LockDatabase($workspace.'/locks', $waiter, $clock);
-    $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $lock = new FairSQLiteLock(
-        $app,
-        $database,
-        $waiter,
-        $staleHeadSeconds,
-        static function (Throwable $exception): void {},
-        static function (): void {},
-        $clock,
-    );
+    $container = new Container;
+    Container::setInstance($container);
+    Facade::setFacadeApplication($container);
+    $container->instance('log', new class($workspace, $ticketCreatedSignal)
+    {
+        public function __construct(private readonly string $workspace, private readonly string $ticketCreatedSignal) {}
 
-    return [$database, $app, $lock, $clock];
+        /** @param array<string, mixed> $context */
+        public function debug(string $message, array $context): void
+        {
+            if (($context['event'] ?? null) === 'ticket_created') {
+                signal($this->workspace, $this->ticketCreatedSignal);
+            }
+        }
+    });
+}
+
+/** Returns a deterministic clock that advances on every stale-state observation. */
+function advancingClock(): Closure
+{
+    $now = 0.0;
+
+    return static function () use (&$now): float {
+        return $now += 0.6;
+    };
+}
+
+/** Holds stale observation until both recoverers have joined the same queue head. */
+function coordinatedStaleClock(string $workspace, string $label, string $peer): Closure
+{
+    $now = 0.0;
+    $joined = false;
+
+    return static function () use (&$now, &$joined, $workspace, $label, $peer): float {
+        if (! $joined) {
+            signal($workspace, 'stale-observed-'.$label);
+            waitForSignal($workspace, 'stale-observed-'.$peer);
+            $joined = true;
+        }
+
+        return $now += 0.6;
+    };
 }
 
 /** @param array<string, mixed> $arguments */
 function runMutualWriter(string $workspace, array $arguments): void
 {
-    [$database, $app, $lock, $clock] = fairRuntime($workspace, 2.0);
+    $role = (string) $arguments['role'];
     $label = (string) $arguments['label'];
-    $ticket = $lock->acquire($clock() + 5.0);
-    recordEvent($workspace, 'enter:'.$label);
-    pauseChild();
-    recordEvent($workspace, 'exit:'.$label);
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
+    if ($role === 'contender') {
+        waitForSignal($workspace, 'mutual-holder-entered');
     }
+    $connection = fairConnection(
+        $workspace,
+        'mutual-'.$label,
+        2.0,
+        ticketCreatedSignal: $role === 'contender' ? 'mutual-contender-queued' : null,
+    );
+    $connection->transaction(static function () use ($connection, $workspace, $role, $label): void {
+        recordEvent($workspace, 'enter:'.$label);
+        if ($role === 'holder') {
+            signal($workspace, 'mutual-holder-entered');
+            waitForSignal($workspace, 'mutual-contender-queued');
+        }
+        $connection->statement('INSERT INTO mutual_writes (label) VALUES (?)', [$label]);
+        recordEvent($workspace, 'exit:'.$label);
+    });
 }
 
-/** Recovers a stale ticket and writes under the acquired application fence. */
-function runStaleRecovery(string $workspace): void
+/**
+ * Recovers a stale ticket and writes through the real Laravel connection lifecycle.
+ *
+ * @param  array<string, mixed>  $arguments  Optional unique value written by this recoverer.
+ */
+function runStaleRecovery(string $workspace, array $arguments): void
 {
-    $now = 0.0;
-    $clock = static function () use (&$now): float {
-        return $now += 0.6;
-    };
-    $waiter = new PollingWaiter();
-    $database = new LockDatabase($workspace.'/locks', $waiter, $clock);
-    $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $exception): void {}, static function (): void {}, $clock);
-    $ticket = $lock->acquire();
-    $app->exec("INSERT INTO writes VALUES ('recovered')");
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
-    }
+    $label = isset($arguments['label']) ? (string) $arguments['label'] : 'recovered';
+    $peer = isset($arguments['peer']) ? (string) $arguments['peer'] : null;
+    $clock = $peer === null ? advancingClock() : coordinatedStaleClock($workspace, $label, $peer);
+    $connection = fairConnection(
+        $workspace,
+        'stale-'.$label,
+        monotonic: $clock,
+        ticketCreatedSignal: $peer === null ? null : 'stale-ticket-'.$label,
+    );
+    $connection->transaction(
+        static fn (FairSQLiteConnection $connection): bool => $connection->statement(
+            'INSERT INTO writes (value) VALUES (?)',
+            [$label],
+        ),
+    );
 }
 
 /** @param array<string, mixed> $arguments */
 function runPreCommitCrash(string $workspace, array $arguments): void
 {
-    [$database, $app, $lock, $clock] = fairRuntime($workspace);
+    $role = (string) $arguments['role'];
+    $connection = fairConnection($workspace, 'pre-commit-'.$role, monotonic: advancingClock());
     if ($arguments['role'] === 'crasher') {
-        $lock->acquire($clock() + 5.0);
-        $app->exec("INSERT INTO writes VALUES ('crashed')");
+        $connection->beginTransaction();
+        $connection->statement("INSERT INTO writes VALUES ('crashed')");
         signal($workspace, 'crashed-ready');
         exit(23);
     }
     waitForSignal($workspace, 'crashed-ready');
-    $ticket = $lock->acquire($clock() + 5.0);
-    $app->exec("INSERT INTO writes VALUES ('follower')");
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
-    }
+    $connection->transaction(
+        static fn (FairSQLiteConnection $connection): bool => $connection->statement(
+            "INSERT INTO writes VALUES ('follower')",
+        ),
+    );
 }
 
 /** @param array<string, mixed> $arguments */
@@ -194,12 +269,8 @@ function runReclaimedTicket(string $workspace, array $arguments): void
 {
     if ($arguments['role'] === 'reclaimer') {
         $pdo = new PDO('sqlite:'.$workspace.'/locks/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-        do {
-            $tickets = $pdo->query('SELECT ticket FROM tickets ORDER BY ticket')->fetchAll(PDO::FETCH_COLUMN);
-            if (count($tickets) < 2) {
-                pauseChild();
-            }
-        } while (count($tickets) < 2);
+        waitForSignal($workspace, 'reclaimed-acquirer-queued');
+        $tickets = $pdo->query('SELECT ticket FROM tickets ORDER BY ticket')->fetchAll(PDO::FETCH_COLUMN);
         $reclaimed = (int) max($tickets);
         $pdo->exec('PRAGMA busy_timeout=0');
         $pdo->exec('BEGIN IMMEDIATE');
@@ -215,82 +286,99 @@ function runReclaimedTicket(string $workspace, array $arguments): void
     $clock = static function () use (&$now, $workspace): float {
         return signalValue($workspace, 'reclaimed') === null ? $now : $now += 0.6;
     };
-    $waiter = new PollingWaiter();
-    $database = new LockDatabase($workspace.'/locks', $waiter, $clock);
-    $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $exception): void {}, static function (): void {}, $clock);
-    $ticket = $lock->acquire();
-    echo $ticket;
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
-    }
+    $connection = fairConnection(
+        $workspace,
+        'reclaimed-acquirer',
+        monotonic: $clock,
+        ticketCreatedSignal: 'reclaimed-acquirer-queued',
+    );
+    $connection->transaction(static function () use ($connection, $workspace): void {
+        echo currentHeadTicket($workspace);
+        $connection->statement("INSERT INTO reclaimed_writes VALUES ('acquired')");
+    });
 }
 
 /** @param array<string, mixed> $arguments */
 function runCommittedCrash(string $workspace, array $arguments): void
 {
-    $now = 0.0;
-    $clock = static function () use (&$now): float {
-        return $now += 0.6;
-    };
-    $waiter = new PollingWaiter();
-    $database = new LockDatabase($workspace.'/locks', $waiter, $clock);
-    $app = new PDO('sqlite:'.$workspace.'/app.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $lock = new FairSQLiteLock($app, $database, $waiter, 1.0, static function (Throwable $exception): void {}, static function (): void {}, $clock);
     if ($arguments['role'] === 'writer') {
-        $ticket = $lock->acquire();
-        $app->exec("INSERT INTO writes VALUES ('committed-before-crash')");
-        $app->commit();
-        signal($workspace, 'committed-crash', (string) $ticket);
-        exit(24);
+        $appPath = $workspace.'/app.sqlite';
+        $pdo = new class('sqlite:'.$appPath, $workspace) extends PDO
+        {
+            public function __construct(string $dsn, private readonly string $workspace)
+            {
+                parent::__construct($dsn, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            }
+
+            public function commit(): bool
+            {
+                parent::commit();
+                signal($this->workspace, 'committed-crash');
+                exit(24);
+            }
+        };
+        $connection = fairConnection(
+            $workspace,
+            'committed-crash-writer',
+            monotonic: advancingClock(),
+            pdo: $pdo,
+        );
+        $connection->transaction(
+            static fn (FairSQLiteConnection $connection): bool => $connection->statement(
+                "INSERT INTO writes VALUES ('committed-before-crash')",
+            ),
+        );
+
+        exit(92);
     }
     waitForSignal($workspace, 'committed-crash');
-    $ticket = $lock->acquire();
-    $app->exec("INSERT INTO writes VALUES ('follower-after-stale')");
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
-    }
+    $connection = fairConnection($workspace, 'committed-crash-follower', monotonic: advancingClock());
+    $connection->transaction(
+        static fn (FairSQLiteConnection $connection): bool => $connection->statement(
+            "INSERT INTO writes VALUES ('follower-after-stale')",
+        ),
+    );
 }
 
 /** @param array<string, mixed> $arguments */
 function runFifo(string $workspace, array $arguments): void
 {
-    [$database, $app, $lock, $clock] = fairRuntime($workspace, 30.0);
+    $role = (string) $arguments['role'];
     if ($arguments['role'] === 'holder') {
-        $ticket = $lock->acquire($clock() + 10.0);
-        if ($ticket !== null) {
-            exit(91);
-        }
-        signal($workspace, 'holder-ready');
-        $observer = new PDO('sqlite:'.$workspace.'/locks/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-        do {
-            $count = (int) $observer->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
-            if ($count < 3) {
-                pauseChild();
-            }
-        } while ($count < 3);
-        $app->commit();
+        $connection = fairConnection($workspace, 'fifo-holder', 30.0);
+        $connection->beginTransaction();
+        signal($workspace, 'holder-ready-one');
+        signal($workspace, 'holder-ready-two');
+        signal($workspace, 'holder-ready-three');
+        waitForSignal($workspace, 'fifo-ticket-three');
+        $connection->commit();
 
         return;
     }
-    waitForSignal($workspace, 'holder-ready');
     $requiredTickets = (int) $arguments['required_tickets'];
-    $observer = new PDO('sqlite:'.$workspace.'/locks/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    do {
-        $count = (int) $observer->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
-        if ($count < $requiredTickets) {
-            pauseChild();
-        }
-    } while ($count < $requiredTickets);
-    $ticket = $lock->acquire($clock() + 10.0);
-    $statement = $app->prepare('INSERT INTO fifo (label, ticket) VALUES (:label, :ticket)');
-    $statement->execute(['label' => $arguments['label'], 'ticket' => $ticket]);
-    $app->commit();
-    if ($ticket !== null) {
-        $database->deleteExact($ticket);
+    $previousLabel = match ($requiredTickets) {
+        0 => null,
+        1 => 'one',
+        2 => 'two',
+        default => throw new RuntimeException('The FIFO process prerequisite is invalid.'),
+    };
+    $label = (string) $arguments['label'];
+    waitForSignal($workspace, 'holder-ready-'.$label);
+    if ($previousLabel !== null) {
+        waitForSignal($workspace, 'fifo-ticket-'.$previousLabel);
     }
+    $connection = fairConnection(
+        $workspace,
+        'fifo-writer-'.$label,
+        30.0,
+        ticketCreatedSignal: 'fifo-ticket-'.$label,
+    );
+    $connection->transaction(static function () use ($connection, $workspace, $arguments): void {
+        $connection->statement(
+            'INSERT INTO fifo (label, ticket) VALUES (?, ?)',
+            [$arguments['label'], currentHeadTicket($workspace)],
+        );
+    });
 }
 
 /** Proves that an unknown commit retires the connection identity and releases its PDO. */
@@ -567,14 +655,14 @@ function runCleanupFailure(string $workspace): void
 
         public function renderForConsole($output, Throwable $e): void {}
     };
-    $container = new Container();
+    $container = new Container;
     Container::setInstance($container);
     $container->instance(ExceptionHandler::class, $handler);
     $config = [
         'driver' => 'fair-sqlite', 'name' => 'cleanup-failure', 'database' => $appPath, 'prefix' => '',
         'lock_directory' => $lockPath, 'stale_head_seconds' => 0.001, 'wait_strategy' => 'polling', 'debug' => false,
     ];
-    $foreignQueue = new LockDatabase($lockPath, new PollingWaiter(), static fn (): float => hrtime(true) / 1e9);
+    $foreignQueue = new LockDatabase($lockPath, new PollingWaiter, static fn (): float => hrtime(true) / 1e9);
     $foreignQueue->admit();
     $foreignQueue = null;
     $connection = new FairSQLiteConnection($pdo, $appPath, '', $config, $appPath, $lockPath);
@@ -622,13 +710,48 @@ function runCleanupFailure(string $workspace): void
     echo 'original-priority-and-one-cleanup-report';
 }
 
-/** Records a deterministic cross-process signal in the harness coordination database. */
+/** Waits on a real listener and reports the persisted signal notification. */
+function runSignalWaiter(string $workspace): void
+{
+    waitForSignal($workspace, 'roundtrip');
+    echo 'notified';
+}
+
+/** Waits until the listener is registered, then persists and delivers its signal. */
+function runSignalSender(string $workspace): void
+{
+    waitForSignal($workspace, '__waiter__:roundtrip', 2.0);
+    signal($workspace, 'roundtrip');
+    echo 'sent';
+}
+
+/** Records a deterministic cross-process signal and wakes its registered listener. */
 function signal(string $workspace, string $name, string $value = '1'): void
 {
     $pdo = coordinationDatabase($workspace);
     $statement = $pdo->prepare('INSERT OR REPLACE INTO signals (name, value) VALUES (:name, :value)');
     $statement->execute(['name' => $name, 'value' => $value]);
     $statement->closeCursor();
+
+    $address = signalValue($workspace, '__waiter__:'.$name);
+    if ($address === null) {
+        return;
+    }
+
+    $errorCode = 0;
+    $errorMessage = '';
+    $connection = @stream_socket_client(
+        'tcp://'.$address,
+        $errorCode,
+        $errorMessage,
+        1.0,
+        STREAM_CLIENT_CONNECT,
+    );
+    if ($connection === false) {
+        return;
+    }
+    fwrite($connection, '1');
+    fclose($connection);
 }
 
 /** Reads one deterministic cross-process signal value. */
@@ -642,6 +765,21 @@ function signalValue(string $workspace, string $name): ?string
     return is_string($value) ? $value : null;
 }
 
+/** Returns the committed queue head while a fair transaction owns it. */
+function currentHeadTicket(string $workspace): int
+{
+    $observer = new PDO(
+        'sqlite:'.$workspace.'/locks/lock.sqlite',
+        options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
+    );
+    $ticket = $observer->query('SELECT ticket FROM tickets ORDER BY ticket LIMIT 1')->fetchColumn();
+    if (! is_int($ticket) && ! is_string($ticket)) {
+        throw new RuntimeException('The process scenario expected one committed queue head.');
+    }
+
+    return (int) $ticket;
+}
+
 /** Records one globally ordered cross-process event. */
 function recordEvent(string $workspace, string $event): void
 {
@@ -650,30 +788,53 @@ function recordEvent(string $workspace, string $event): void
     $statement->execute(['event' => $event]);
 }
 
-/** Waits for a sibling-process signal without creating test program files. */
-function waitForSignal(string $workspace, string $name): void
+/** Waits boundedly on a real TCP listener for one persisted SQLite signal. */
+function waitForSignal(string $workspace, string $name, float $timeoutSeconds = 10.0): void
 {
-    $pdo = coordinationDatabase($workspace);
-    $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-    if ($pair === false) {
-        throw new RuntimeException('The SQLite fair process signal wait could not create a socket pair.');
+    if (! is_finite($timeoutSeconds) || $timeoutSeconds <= 0.0) {
+        throw new RuntimeException('The process coordination timeout must be finite and positive.');
+    }
+    if (signalValue($workspace, $name) !== null) {
+        return;
     }
 
-    do {
-        $statement = $pdo->prepare('SELECT value FROM signals WHERE name = :name');
-        $statement->execute(['name' => $name]);
-        $value = $statement->fetchColumn();
-        $statement->closeCursor();
-        if ($value === false) {
-            $read = [$pair[0]];
-            $write = [];
-            $except = [];
-            stream_select($read, $write, $except, 0, 10_000);
+    $errorCode = 0;
+    $errorMessage = '';
+    $listener = @stream_socket_server(
+        'tcp://127.0.0.1:0',
+        $errorCode,
+        $errorMessage,
+        STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+    );
+    if ($listener === false) {
+        throw new RuntimeException("The SQLite fair process barrier [{$name}] could not open its listener.");
+    }
+    $address = stream_socket_get_name($listener, false);
+    if (! is_string($address) || $address === '') {
+        fclose($listener);
+        throw new RuntimeException("The SQLite fair process barrier [{$name}] has no listener address.");
+    }
+    $registration = '__waiter__:'.$name;
+    $deadline = hrtime(true) / 1e9 + $timeoutSeconds;
+    signal($workspace, $registration, $address);
+    try {
+        if (signalValue($workspace, $name) !== null) {
+            return;
         }
-    } while ($value === false);
-
-    fclose($pair[0]);
-    fclose($pair[1]);
+        $remaining = max(0.0, $deadline - hrtime(true) / 1e9);
+        $notification = @stream_socket_accept($listener, $remaining);
+        if ($notification !== false) {
+            fclose($notification);
+        }
+        if (signalValue($workspace, $name) === null) {
+            throw new RuntimeException("The SQLite fair process barrier [{$name}] was not reached.");
+        }
+    } finally {
+        $pdo = coordinationDatabase($workspace);
+        $statement = $pdo->prepare('DELETE FROM signals WHERE name = :name AND value = :value');
+        $statement->execute(['name' => $registration, 'value' => $address]);
+        fclose($listener);
+    }
 }
 
 /** Opens the process harness coordination database. */

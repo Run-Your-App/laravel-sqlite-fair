@@ -8,11 +8,12 @@ use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Lock\FairSQLiteLock;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
+use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 
 it('acquires without a ticket and restores the active app busy timeout', function (int $busyTimeout) {
     $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/direct.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $app->exec('PRAGMA busy_timeout='.$busyTimeout);
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $clock = static fn (): float => hrtime(true) / 1e9;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/direct-lock', $waiter, $clock);
     $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
@@ -26,7 +27,7 @@ it('acquires without a ticket and restores the active app busy timeout', functio
 it('admits before the first app fence when queued acquisition is forced', function () {
     $state = (object) ['database' => null, 'headsAtBegin' => []];
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/forced-queued-lock', $waiter, $clock);
     $state->database = $database;
     $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-queued.sqlite', $state) extends PDO
@@ -56,7 +57,7 @@ it('admits before the first app fence when queued acquisition is forced', functi
 it('requeues a forced queued acquisition after fenced ownership revalidation is lost', function () {
     $state = (object) ['database' => null, 'begins' => 0];
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/forced-requeue-lock', $waiter, $clock);
     $state->database = $database;
     $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/forced-requeue.sqlite', $state) extends PDO
@@ -88,7 +89,7 @@ it('requeues a forced queued acquisition after fenced ownership revalidation is 
 it('throws the typed fair timeout after rolling back before one queued cleanup', function () {
     $state = (object) ['now' => 0.0, 'events' => []];
     $clock = static fn (): float => $state->now;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/typed-timeout-lock',
         $waiter,
@@ -147,7 +148,7 @@ it('throws the typed fair timeout after rolling back before one queued cleanup',
 it('throws the typed lock-owner timeout after a bounded queued wait', function () {
     $state = (object) ['now' => 0.0];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -177,7 +178,7 @@ it('does not delete a ticket when the deadline expires before admission', functi
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/typed-pre-admission-timeout-lock',
-        new PollingWaiter(),
+        new PollingWaiter,
         $clock,
         static fn (string $path): PDO => new class($path, $state) extends PDO
         {
@@ -197,7 +198,7 @@ it('does not delete a ticket when the deadline expires before admission', functi
         },
     );
     $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/typed-pre-admission-timeout.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $lock = new FairSQLiteLock($app, $database, new PollingWaiter(), 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
+    $lock = new FairSQLiteLock($app, $database, new PollingWaiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
 
     expect(fn () => $lock->acquire(1.0))
         ->toThrow(FairWaitTimeoutException::class)
@@ -206,7 +207,7 @@ it('does not delete a ticket when the deadline expires before admission', functi
 
 it('queues behind an existing ticket and cleans its own aborted ticket once', function () {
     $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/queued.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $times = [0.0, 0.0, 0.2, 0.4, 0.6, 1.1];
     $clock = static function () use (&$times): float {
         return array_shift($times) ?? 1.1;
@@ -224,7 +225,7 @@ it('queues behind an existing ticket and cleans its own aborted ticket once', fu
 });
 
 it('fails app busy-timeout read zero and restore at their exact pre-business boundary', function (string $mode) {
-    $state = (object) ['mode' => $mode, 'began' => false, 'rollbacks' => 0];
+    $state = (object) ['mode' => $mode, 'began' => false, 'rollbacks' => 0, 'restoreAttempts' => 0];
     $path = $GLOBALS['sqliteFairTestRunDirectory'].'/app-timeout-'.$mode.'.sqlite';
     $app = new class($path, $state) extends PDO
     {
@@ -255,7 +256,10 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
                 return $result;
             }
             if (str_starts_with($this->state->mode, 'restore') && $this->state->began && $statement === 'PRAGMA busy_timeout=777') {
-                throw new RuntimeException('busy timeout restore failure');
+                $this->state->restoreAttempts++;
+                if ($this->state->mode !== 'restore' || $this->state->restoreAttempts === 1) {
+                    throw new RuntimeException('busy timeout restore failure');
+                }
             }
 
             return parent::exec($statement);
@@ -272,7 +276,7 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
         }
     };
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/app-timeout-lock-'.$mode, $waiter, $clock);
     $events = [];
     $lock = new FairSQLiteLock(
@@ -291,14 +295,28 @@ it('fails app busy-timeout read zero and restore at their exact pre-business bou
 
     expect(fn () => $lock->acquire(1.0))->toThrow(RuntimeException::class, 'busy timeout')
         ->and($database->readHead())->toBeNull()
-        ->and($events)->toBe($mode === 'restore-unknown' ? ['unknown', 'disconnect'] : [])
+        ->and($events)->toBe(match ($mode) {
+            'restore-repeat' => ['disconnect'],
+            'restore-unknown' => ['unknown', 'disconnect'],
+            default => [],
+        })
         ->and($state->rollbacks)->toBe(str_starts_with($mode, 'restore') ? 1 : 0)
+        ->and($state->restoreAttempts)->toBe(match ($mode) {
+            'restore' => 2,
+            'restore-repeat' => 2,
+            'restore-unknown' => 1,
+            default => 0,
+        })
         ->and($app->inTransaction())->toBe($mode === 'restore-unknown');
-})->with(['read', 'zero', 'restore', 'restore-unknown']);
+
+    if ($mode === 'restore') {
+        expect((int) $app->query('PRAGMA busy_timeout')->fetchColumn())->toBe(777);
+    }
+})->with(['read', 'zero', 'restore', 'restore-repeat', 'restore-unknown']);
 
 it('arms drains and rechecks the queued condition before blocking', function () {
     $state = (object) ['events' => [], 'database' => null, 'changed' => false];
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -356,7 +374,7 @@ it('transitions from one busy direct begin to exactly one admission before queue
             return parent::exec($statement);
         }
     };
-    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($blocker, $state) implements Waiter
     {
         public function __construct(private PDO $blocker, private object $state) {}
 
@@ -388,7 +406,7 @@ it('transitions from one busy direct begin to exactly one admission before queue
 it('rolls back before cleaning one owned ticket and marks unknown outcome before disconnect', function (bool $unknown) {
     $lockState = (object) ['deletes' => 0];
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/abort-owned-'.($unknown ? 'unknown' : 'known'),
         $waiter,
@@ -471,7 +489,7 @@ it('keeps a foreign non-head off the app fence below stale threshold then recove
             return parent::exec($statement);
         }
     };
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -521,7 +539,7 @@ it('restores busy timeout after direct busy and cleans admission on permanent qu
             return parent::exec($statement);
         }
     };
-    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($blocker, $state) implements Waiter
     {
         public function __construct(private PDO $blocker, private object $state) {}
 
@@ -553,7 +571,7 @@ it('restores busy timeout after direct busy and cleans admission on permanent qu
 
 it('never attempts an app fence while behind two or three committed foreign tickets', function (int $foreignTickets) {
     $state = (object) ['begins' => 0, 'database' => null, 'deleted' => 0];
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -606,7 +624,7 @@ it('never attempts an app fence while behind two or three committed foreign tick
 
 it('rolls back and requeues with a higher ticket when under-fence ownership is missing or foreign', function (string $replacement) {
     $state = (object) ['database' => null, 'begins' => 0, 'removedInitial' => false, 'removedReplacement' => false];
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -661,7 +679,7 @@ it('rolls back and requeues with a higher ticket when under-fence ownership is m
 
 it('switches to queued ownership when a ticket appears between the two direct reads', function () {
     $state = (object) ['database' => null, 'injected' => false, 'pending' => false];
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -709,7 +727,7 @@ it('switches to queued ownership when a ticket appears between the two direct re
 it('does not replay an unknown direct-fence rollback after the second head read changes', function () {
     $state = (object) ['database' => null, 'rollbacks' => 0];
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/direct-rollback-unknown-lock', $waiter, $clock);
     $state->database = $database;
     $app = new class($GLOBALS['sqliteFairTestRunDirectory'].'/direct-rollback-unknown.sqlite', $state) extends PDO
@@ -751,7 +769,7 @@ it('does not replay an unknown direct-fence rollback after the second head read 
 
 it('does not replay unknown queued revalidation rollback and cleans its own ticket once', function () {
     $state = (object) ['database' => null, 'deletedForeign' => false, 'deletes' => 0, 'rollbacks' => 0];
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -826,7 +844,7 @@ it('does not replay unknown queued revalidation rollback and cleans its own tick
 it('linearizes ticketless ownership when a ticket appears after the second direct read executes', function () {
     $state = (object) ['headReads' => 0];
     $clock = static fn (): float => 0.0;
-    $waiter = new PollingWaiter();
+    $waiter = new PollingWaiter;
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/after-reads-lock',
         $waiter,
@@ -880,7 +898,7 @@ it('propagates one absolute deadline unchanged through lock database and fair wa
             return parent::exec($statement);
         }
     };
-    $waiter = new class($blocker, $state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($blocker, $state) implements Waiter
     {
         public function __construct(private PDO $blocker, private object $state) {}
 
@@ -940,7 +958,7 @@ it('propagates one absolute deadline unchanged through lock database and fair wa
 it('keeps recovery primary errors and cleans one own ticket after unknown fence rollback', function (string $mode) {
     $state = (object) ['now' => 0.0, 'foreignAttempts' => 0, 'ownCleanups' => 0, 'rollbacks' => 0];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 
@@ -1022,7 +1040,7 @@ it('resets stale observation when fenced revalidation changes or vanishes', func
     );
     $state = (object) ['now' => 0.0, 'begins' => 0, 'blocks' => 0, 'beginsAtBlock' => [], 'database' => null];
     $clock = static fn (): float => $state->now;
-    $waiter = new class($state) implements RunYourApp\LaravelSqliteFair\Wait\Waiter
+    $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
 

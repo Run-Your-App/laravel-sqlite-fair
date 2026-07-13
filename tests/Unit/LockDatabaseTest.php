@@ -13,7 +13,7 @@ it('bootstraps the exact lock schema and supports ordered ticket operations', fu
     $owned = null;
     $database = new LockDatabase(
         $directory,
-        new PollingWaiter(),
+        new PollingWaiter,
         static fn (): float => hrtime(true) / 1e9,
         static function (string $path) use (&$owned): PDO {
             return $owned = new PDO('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
@@ -40,6 +40,44 @@ it('bootstraps the exact lock schema and supports ordered ticket operations', fu
         ->and((int) $owned->query('PRAGMA user_version')->fetchColumn())->toBe(1);
 });
 
+it('configures persistent pragmas once per lock pdo instead of once per ticket', function () {
+    $state = (object) ['journal' => 0, 'synchronous' => 0];
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/pragma-once-per-handle';
+    $database = new LockDatabase(
+        $directory,
+        new PollingWaiter,
+        static fn (): float => 0.0,
+        static fn (string $path): PDO => new class($path, $state) extends PDO
+        {
+            public function __construct(string $path, private readonly object $state)
+            {
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            }
+
+            public function exec(string $statement): int|false
+            {
+                if ($statement === 'PRAGMA journal_mode=DELETE') {
+                    $this->state->journal++;
+                }
+                if ($statement === 'PRAGMA synchronous=NORMAL') {
+                    $this->state->synchronous++;
+                }
+
+                return parent::exec($statement);
+            }
+        },
+    );
+
+    $first = $database->admit();
+    $second = $database->admit();
+    $database->deleteExact($first);
+    $database->deleteExact($second);
+
+    expect($state->journal)->toBe(1)
+        ->and($state->synchronous)->toBe(1)
+        ->and($database->readHead())->toBeNull();
+});
+
 it('revalidates a concurrent bootstrap that commits between the autocommit prechecks', function () {
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/concurrent-bootstrap-precheck';
     $state = (object) ['interleaved' => false];
@@ -54,13 +92,13 @@ it('revalidates a concurrent bootstrap that commits between the autocommit prech
         {
             if (! $this->state->interleaved && str_starts_with($query, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE")) {
                 $this->state->interleaved = true;
-                (new LockDatabase($this->directory, new PollingWaiter(), static fn (): float => 0.0))->open();
+                (new LockDatabase($this->directory, new PollingWaiter, static fn (): float => 0.0))->open();
             }
 
             return parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0, $factory);
 
     $database->open();
 
@@ -82,7 +120,7 @@ it('does not classify a generic throwable code as sqlite contention', function (
 });
 
 it('uses an idempotent missing-row exact delete', function () {
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/missing-delete', new PollingWaiter(), static fn (): float => hrtime(true) / 1e9);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/missing-delete', new PollingWaiter, static fn (): float => hrtime(true) / 1e9);
     $database->deleteExact(999);
 
     expect($database->readHead())->toBeNull();
@@ -95,7 +133,7 @@ it('rejects an unknown schema version without changing it', function () {
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('PRAGMA user_version=2');
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class)
         ->and((int) $pdo->query('PRAGMA user_version')->fetchColumn())->toBe(2);
@@ -108,7 +146,7 @@ it('rejects an unexpected bootstrap table without replacing it', function () {
     $pdo->exec('PRAGMA journal_mode=DELETE');
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE unexpected (id INTEGER PRIMARY KEY)');
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class)
         ->and($pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='unexpected'")->fetchColumn())->toBe('unexpected');
@@ -152,7 +190,7 @@ it('does not open a new handle for cleanup', function () {
     $factoryCalls = 0;
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/cleanup-no-open',
-        new PollingWaiter(),
+        new PollingWaiter,
         static fn (): float => 0.0,
         static function (string $path) use (&$factoryCalls): PDO {
             $factoryCalls++;
@@ -170,7 +208,7 @@ it('sets zero busy timeout first and completes pragma setup before bootstrap beg
     $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/ordered-bootstrap';
     $database = new LockDatabase(
         $directory,
-        new PollingWaiter(),
+        new PollingWaiter,
         static fn (): float => 0.0,
         static fn (string $path): PDO => new class($path, $state) extends PDO
         {
@@ -227,7 +265,7 @@ it('does not replay admission after an unknown commit and reopens only on a late
             }
         };
     };
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0, $factory);
     $database->open();
     $state->throwCommit = true;
 
@@ -273,7 +311,7 @@ it('retries only the active commit after numeric sqlite busy', function () {
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/busy-commit',
-        new PollingWaiter(),
+        new PollingWaiter,
         static fn (): float => hrtime(true) / 1e9,
         $factory,
     );
@@ -324,7 +362,7 @@ it('does not retry a locked or unknown commit outcome', function (?int $sqliteCo
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/terminal-commit-'.$failure->getMessage(),
-        new PollingWaiter(),
+        new PollingWaiter,
         static fn (): float => hrtime(true) / 1e9,
         $factory,
     );
@@ -373,7 +411,7 @@ it('rolls back an active busy commit when its absolute deadline expires', functi
     };
     $database = new LockDatabase(
         $GLOBALS['sqliteFairTestRunDirectory'].'/busy-commit-deadline',
-        new PollingWaiter(),
+        new PollingWaiter,
         $clock,
         $factory,
     );
@@ -387,6 +425,108 @@ it('rolls back an active busy commit when its absolute deadline expires', functi
     expect($database->readHead())->toBeNull()
         ->and($database->admit())->toBe(1);
 });
+
+it('rolls back an active busy commit when the waiter fails without replaying the mutation', function (string $failurePoint) {
+    $state = (object) [
+        'active' => false,
+        'begins' => 0,
+        'inserts' => 0,
+        'commits' => 0,
+        'rollbacks' => 0,
+        'pdo' => null,
+    ];
+    $waiter = new class($failurePoint) implements Waiter
+    {
+        public function __construct(private readonly string $failurePoint) {}
+
+        public function arm(): void
+        {
+            if ($this->failurePoint === 'arm') {
+                throw new RuntimeException('waiter arm failed');
+            }
+        }
+
+        public function drain(): void
+        {
+            if ($this->failurePoint === 'drain') {
+                throw new RuntimeException('waiter drain failed');
+            }
+        }
+
+        public function block(?float $deadline, callable $monotonic): void
+        {
+            if ($this->failurePoint === 'block') {
+                throw new RuntimeException('waiter block failed');
+            }
+        }
+    };
+    $factory = static function (string $path) use ($state, $failurePoint): PDO {
+        return $state->pdo = new class($path, $state, $failurePoint) extends PDO
+        {
+            public function __construct(string $path, private readonly object $state, private readonly string $failurePoint)
+            {
+                parent::__construct('sqlite:'.$path, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            }
+
+            public function exec(string $statement): int|false
+            {
+                if ($this->state->active && $statement === 'BEGIN EXCLUSIVE') {
+                    $this->state->begins++;
+                }
+                if ($this->state->active && $statement === 'INSERT INTO tickets DEFAULT VALUES') {
+                    $this->state->inserts++;
+                }
+
+                return parent::exec($statement);
+            }
+
+            public function commit(): bool
+            {
+                if ($this->state->active) {
+                    $this->state->commits++;
+                    $busyAttempts = $this->failurePoint === 'block' ? 2 : 1;
+                    if ($this->state->commits <= $busyAttempts) {
+                        $exception = new PDOException('busy before waiter failure');
+                        $exception->errorInfo = ['HY000', 5, 'ignored'];
+
+                        throw $exception;
+                    }
+                }
+
+                return parent::commit();
+            }
+
+            public function rollBack(): bool
+            {
+                if ($this->state->active) {
+                    $this->state->rollbacks++;
+                }
+
+                return parent::rollBack();
+            }
+        };
+    };
+    $database = new LockDatabase(
+        $GLOBALS['sqliteFairTestRunDirectory'].'/busy-commit-waiter-'.$failurePoint,
+        $waiter,
+        static fn (): float => 0.0,
+        $factory,
+    );
+    $database->open();
+    $state->active = true;
+
+    expect(fn () => $database->admit())->toThrow(RuntimeException::class, "waiter {$failurePoint} failed")
+        ->and($state->begins)->toBe(1)
+        ->and($state->inserts)->toBe(1)
+        ->and($state->commits)->toBe($failurePoint === 'block' ? 2 : 1)
+        ->and($state->rollbacks)->toBe(1)
+        ->and($state->pdo)->toBeInstanceOf(PDO::class)
+        ->and($state->pdo?->inTransaction())->toBeFalse();
+
+    $state->active = false;
+    expect($database->readHead())->toBeNull()
+        ->and($database->admit())->toBe(1);
+})->with(['arm', 'drain', 'block']);
 
 it('does not replay exact delete units after an unknown commit', function (string $unit) {
     $state = (object) ['factory' => 0, 'throwCommit' => false, 'deletes' => 0];
@@ -421,7 +561,7 @@ it('does not replay exact delete units after an unknown commit', function (strin
             }
         };
     };
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0, $factory);
     $ticket = $database->admit();
     $state->throwCommit = true;
 
@@ -497,7 +637,7 @@ it('rejects invalid ticket columns without changing the schema', function () {
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE tickets (wrong INTEGER PRIMARY KEY AUTOINCREMENT)');
     $pdo->exec('PRAGMA user_version=1');
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class)
         ->and($pdo->query('PRAGMA table_info(tickets)')->fetchAll(PDO::FETCH_COLUMN, 1))->toBe(['wrong']);
@@ -511,7 +651,7 @@ it('rejects a ticket primary key without autoincrement without changing it', fun
     $pdo->exec('PRAGMA synchronous=NORMAL');
     $pdo->exec('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY)');
     $pdo->exec('PRAGMA user_version=1');
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class)
         ->and($pdo->query("SELECT sql FROM sqlite_master WHERE name='tickets'")->fetchColumn())
@@ -541,7 +681,7 @@ it('fails setup immediately for a non-busy error and invalidates the handle', fu
             }
         };
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-permanent', new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-permanent', new PollingWaiter, static fn (): float => 0.0, $factory);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class, 'permanent setup failure')
         ->and($state->calls)->toBe(1)
@@ -569,7 +709,7 @@ it('stops a busy setup retry at the supplied absolute deadline', function () {
             throw $exception;
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-deadline', new PollingWaiter(), $clock, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-deadline', new PollingWaiter, $clock, $factory);
 
     expect(fn () => $database->open(1.0))->toThrow(FairWaitTimeoutException::class, 'deadline')
         ->and($state->calls)->toBe(1);
@@ -726,7 +866,7 @@ it('keeps the statement error primary and invalidates after rollback failure', f
             }
         };
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/rollback-failure-'.$unit, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/rollback-failure-'.$unit, new PollingWaiter, static fn (): float => 0.0, $factory);
     $ticket = $database->admit();
     $state->unit = $unit;
     $operation = match ($unit) {
@@ -1012,7 +1152,7 @@ it('does not retry permanent setup statement failures', function (string $statem
             return parent::exec($statement);
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-permanent-'.md5($statement), new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/setup-permanent-'.md5($statement), new PollingWaiter, static fn (): float => 0.0, $factory);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class, 'permanent setup unit')
         ->and($state->calls)->toBe(1);
@@ -1043,7 +1183,7 @@ it('rejects invalid final pragma readbacks without replacing the schema', functi
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0, $factory);
 
     expect(fn () => $database->open())->toThrow(RuntimeException::class, 'PRAGMA validation')
         ->and($seed->query("SELECT sql FROM sqlite_master WHERE name='tickets'")->fetchColumn())
@@ -1060,7 +1200,7 @@ it('rejects a corrupt lock database without replacing its bytes', function () {
     $path = $directory.'/lock.sqlite';
     copy(dirname(__DIR__).'/Fixtures/corrupt-lock.sqlite', $path);
     $before = hash_file('sha256', $path);
-    $database = new LockDatabase($directory, new PollingWaiter(), static fn (): float => 0.0);
+    $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
     expect(fn () => $database->open())->toThrow(PDOException::class)
         ->and(hash_file('sha256', $path))->toBe($before);
@@ -1085,7 +1225,7 @@ it('does not retry a permanent head-read failure', function () {
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/head-permanent', new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/head-permanent', new PollingWaiter, static fn (): float => 0.0, $factory);
     $database->open();
     $state->fail = true;
     expect(fn () => $database->readHead())->toThrow(RuntimeException::class, 'permanent head read')
@@ -1117,7 +1257,7 @@ it('stops a busy head read before its second statecheck at the absolute deadline
             return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/head-deadline', new PollingWaiter(), $clock, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/head-deadline', new PollingWaiter, $clock, $factory);
     $database->open();
     $state->fail = true;
     $now = -1.0;
@@ -1159,7 +1299,7 @@ it('stops exact delete begin and statement retries at the same absolute deadline
             return parent::prepare($query, $options);
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/delete-deadline-'.$point, new PollingWaiter(), $clock, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/delete-deadline-'.$point, new PollingWaiter, $clock, $factory);
     $ticket = $database->admit();
     $state->active = true;
     expect(fn () => $database->deleteExact($ticket, 1.0))->toThrow(FairWaitTimeoutException::class, 'deadline')
@@ -1279,7 +1419,7 @@ it('does not retry permanent statement errors after successful rollback', functi
             return parent::prepare($query, $options);
         }
     };
-    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/permanent-statement-'.$unit, new PollingWaiter(), static fn (): float => 0.0, $factory);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/permanent-statement-'.$unit, new PollingWaiter, static fn (): float => 0.0, $factory);
     $ticket = $database->admit();
     $state->unit = $unit;
     $operation = match ($unit) {

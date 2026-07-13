@@ -22,6 +22,13 @@ use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteConnector;
 use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteServiceProvider;
 use RunYourApp\LaravelSqliteFair\Wait\WaiterFactory;
 
+/**
+ * Boots the package connection through Laravel's RefreshDatabase lifecycle.
+ *
+ * The dedicated test case keeps teardown assertions available until the trait
+ * has completed its automatic rollback, allowing integration tests to verify
+ * that Fair SQLite leaves neither a ticket nor an open PDO transaction behind.
+ */
 class FairSQLiteRefreshDatabaseTestCase extends TestCase
 {
     use RefreshDatabase;
@@ -37,6 +44,12 @@ class FairSQLiteRefreshDatabaseTestCase extends TestCase
         $assertion?->__invoke();
     }
 
+    /**
+     * Registers one assertion to run after RefreshDatabase finishes teardown.
+     *
+     * @param  Closure(): void  $callback  Assertion that inspects the finalized connection state.
+     * @return void The assertion is retained until this test case tears down.
+     */
     public function afterRefreshDatabaseTeardown(Closure $callback): void
     {
         $this->refreshDatabaseTeardownAssertion = $callback;
@@ -96,7 +109,7 @@ beforeEach(function (): void {
         'debug' => false,
     ]);
 
-    $this->connection = (new FairSQLiteConnector())->connect([
+    $this->connection = (new FairSQLiteConnector)->connect([
         'driver' => 'fair-sqlite',
         'database' => $this->databasePath,
         'prefix' => '',
@@ -104,7 +117,7 @@ beforeEach(function (): void {
         'stale_head_seconds' => 10.0,
         'wait_strategy' => 'polling',
     ], 'connection-'.str_replace('.', '-', uniqid('', true)));
-    $this->connection->setEventDispatcher(new Dispatcher());
+    $this->connection->setEventDispatcher(new Dispatcher);
     $this->connection->unprepared('CREATE TABLE examples (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL)');
 });
 
@@ -120,7 +133,7 @@ test('native connection startup prepares its missing lock directory before armin
     $lockDirectory = $workspace.'/missing-lock-directory';
     touch($databasePath);
 
-    $connection = (new FairSQLiteConnector())->connect([
+    $connection = (new FairSQLiteConnector)->connect([
         'driver' => 'fair-sqlite',
         'database' => $databasePath,
         'prefix' => '',
@@ -284,7 +297,7 @@ test('outer lifecycle orders pdo cleanup manager and event for ticketless and qu
             return (int) $observer->query('SELECT COUNT(*) FROM tickets')->fetchColumn();
         }
     });
-    $dispatcher = new Dispatcher();
+    $dispatcher = new Dispatcher;
     $dispatcher->listen(TransactionBeginning::class, static fn () => $record('event-begin'));
     $dispatcher->listen(TransactionCommitting::class, static fn () => $record('event-committing'));
     $dispatcher->listen(TransactionCommitted::class, static fn () => $record('event-committed'));
@@ -373,12 +386,14 @@ test('callback concurrency retries only after a completed outer rollback', funct
         ->and($this->connection->table('examples')->value('value'))->toBe('retried');
 });
 
-test('nested callback concurrency becomes a deadlock exception without callback retry', function (): void {
+test('nested callback concurrency rolls back its savepoint before throwing without retry', function (): void {
     $attempts = 0;
     $this->connection->beginTransaction();
+    $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['outer']);
     try {
-        $this->connection->transaction(function () use (&$attempts): never {
+        $this->connection->transaction(function (FairSQLiteConnection $connection) use (&$attempts): never {
             $attempts++;
+            $connection->statement('INSERT INTO examples (value) VALUES (?)', ['nested']);
             throw new PDOException('database is locked');
         }, 2);
         $this->fail('Nested concurrency should not retry.');
@@ -387,7 +402,150 @@ test('nested callback concurrency becomes a deadlock exception without callback 
 
     expect($attempts)->toBe(1)
         ->and($this->connection->transactionLevel())->toBe(1);
-    $this->connection->rollBack();
+    $this->connection->commit();
+    expect($this->connection->table('examples')->pluck('value')->all())->toBe(['outer']);
+});
+
+test('failed began transaction event rolls back manager state before a later commit', function (): void {
+    $manager = new DatabaseTransactionsManager;
+    $this->connection->setTransactionManager($manager);
+    $staleCallbackRan = false;
+    $throwOnFirstBegin = true;
+    $dispatcher = new Dispatcher;
+    $dispatcher->listen(TransactionBeginning::class, function () use (&$staleCallbackRan, &$throwOnFirstBegin): void {
+        if (! $throwOnFirstBegin) {
+            return;
+        }
+
+        $throwOnFirstBegin = false;
+        $this->connection->afterCommit(function () use (&$staleCallbackRan): void {
+            $staleCallbackRan = true;
+        });
+
+        throw new RuntimeException('begin listener failure');
+    });
+    $this->connection->setEventDispatcher($dispatcher);
+
+    expect(fn () => $this->connection->beginTransaction())
+        ->toThrow(RuntimeException::class, 'begin listener failure')
+        ->and($this->connection->transactionLevel())->toBe(0)
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty();
+
+    $this->connection->transaction(function (FairSQLiteConnection $connection): void {
+        $connection->statement('INSERT INTO examples (value) VALUES (?)', ['after-listener-failure']);
+    });
+
+    expect($staleCallbackRan)->toBeFalse()
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty()
+        ->and($this->connection->table('examples')->value('value'))->toBe('after-listener-failure');
+});
+
+test('manager begin failure after parent state mutation removes its record before a later commit', function (): void {
+    $staleCallbackRan = false;
+    $staleCallback = function () use (&$staleCallbackRan): void {
+        $staleCallbackRan = true;
+    };
+    $manager = new class($staleCallback) extends DatabaseTransactionsManager
+    {
+        private bool $failFirstBegin = true;
+
+        public function __construct(private readonly Closure $staleCallback)
+        {
+            parent::__construct();
+        }
+
+        public function begin($connection, $level): void
+        {
+            parent::begin($connection, $level);
+            if (! $this->failFirstBegin) {
+                return;
+            }
+
+            $this->failFirstBegin = false;
+            $this->currentTransaction[$connection]->addCallback($this->staleCallback);
+
+            throw new RuntimeException('manager failed after parent begin');
+        }
+
+        public function hasCurrent(string $connection): bool
+        {
+            return ($this->currentTransaction[$connection] ?? null) !== null;
+        }
+    };
+    $this->connection->setTransactionManager($manager);
+
+    expect(fn () => $this->connection->beginTransaction())
+        ->toThrow(RuntimeException::class, 'manager failed after parent begin')
+        ->and($this->connection->transactionLevel())->toBe(0)
+        ->and($manager->hasCurrent((string) $this->connection->getName()))->toBeFalse()
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty();
+
+    $this->connection->transaction(function (FairSQLiteConnection $connection): void {
+        $connection->statement('INSERT INTO examples (value) VALUES (?)', ['after-partial-manager-begin']);
+    });
+
+    expect($staleCallbackRan)->toBeFalse()
+        ->and($manager->hasCurrent((string) $this->connection->getName()))->toBeFalse()
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty()
+        ->and($this->connection->table('examples')->value('value'))->toBe('after-partial-manager-begin');
+});
+
+test('failed nested began transaction event rolls back its savepoint and manager state', function (): void {
+    $manager = new DatabaseTransactionsManager;
+    $this->connection->setTransactionManager($manager);
+    $this->connection->beginTransaction();
+    $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['outer']);
+
+    $staleCallbackRan = false;
+    $dispatcher = new Dispatcher;
+    $dispatcher->listen(TransactionBeginning::class, function () use (&$staleCallbackRan): void {
+        $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['nested-listener']);
+        $this->connection->afterCommit(function () use (&$staleCallbackRan): void {
+            $staleCallbackRan = true;
+        });
+
+        throw new RuntimeException('nested begin listener failure');
+    });
+    $this->connection->setEventDispatcher($dispatcher);
+
+    expect(fn () => $this->connection->beginTransaction())
+        ->toThrow(RuntimeException::class, 'nested begin listener failure')
+        ->and($this->connection->transactionLevel())->toBe(1)
+        ->and($this->connection->table('examples')->pluck('value')->all())->toBe(['outer']);
+
+    $this->connection->commit();
+
+    expect($staleCallbackRan)->toBeFalse()
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty()
+        ->and($this->connection->table('examples')->pluck('value')->all())->toBe(['outer']);
+});
+
+test('failed pretend began transaction event restores temporary framework state', function (): void {
+    $manager = new DatabaseTransactionsManager;
+    $this->connection->setTransactionManager($manager);
+    $staleCallbackRan = false;
+    $dispatcher = new Dispatcher;
+    $dispatcher->listen(TransactionBeginning::class, function () use (&$staleCallbackRan): void {
+        $this->connection->afterCommit(function () use (&$staleCallbackRan): void {
+            $staleCallbackRan = true;
+        });
+
+        throw new RuntimeException('pretend begin listener failure');
+    });
+    $this->connection->setEventDispatcher($dispatcher);
+
+    expect(fn () => $this->connection->pretend(function (FairSQLiteConnection $connection): void {
+        $connection->beginTransaction();
+    }))->toThrow(RuntimeException::class, 'pretend begin listener failure')
+        ->and($this->connection->transactionLevel())->toBe(0)
+        ->and($manager->getPendingTransactions())->toBeEmpty()
+        ->and($manager->getCommittedTransactions())->toBeEmpty()
+        ->and($staleCallbackRan)->toBeFalse();
 });
 
 test('wait expiry before acquisition invokes the callback zero times', function (): void {
@@ -768,7 +926,7 @@ test('callback and pre business rollback unknown keep the original error and unf
     ], $appPath, $lockPath);
     $pdo = null;
     $events = [];
-    $dispatcher = new Dispatcher();
+    $dispatcher = new Dispatcher;
     $dispatcher->listen([
         TransactionBeginning::class,
         TransactionCommitted::class,
@@ -839,7 +997,7 @@ test('callback commit unknown occurs after committing and never retries or final
         'lock_directory' => $workspace.'/lock', 'stale_head_seconds' => 10.0, 'wait_strategy' => 'polling',
     ], $appPath, $workspace.'/lock');
     $events = [];
-    $dispatcher = new Dispatcher();
+    $dispatcher = new Dispatcher;
     $dispatcher->listen(TransactionBeginning::class, function () use (&$events): void {
         $events[] = 'begin';
     });
@@ -899,7 +1057,7 @@ test('savepoint rollback unknown preserves manager pending callback and event st
     };
     $connection->setTransactionManager($manager);
     $events = [];
-    $dispatcher = new Dispatcher();
+    $dispatcher = new Dispatcher;
     $dispatcher->listen(TransactionRolledBack::class, function () use (&$events): void {
         $events[] = 'rollback';
     });
@@ -968,7 +1126,7 @@ test('unknown identity blocks purge reconnect connector aliases and partial path
     app('db')->forgetExtension($name);
 
     expect(fn () => app('db')->connection($name))->toThrow(FairSQLiteException::class)
-        ->and(fn () => (new FairSQLiteConnector())->connect($config, $name))->toThrow(FairSQLiteException::class)
+        ->and(fn () => (new FairSQLiteConnector)->connect($config, $name))->toThrow(FairSQLiteException::class)
         ->and(fn () => FairSQLiteConnection::assertIdentityConfiguration($name, $appPath, $workspace.'/other-lock'))
         ->toThrow(FairSQLiteException::class)
         ->and(fn () => FairSQLiteConnection::assertIdentityConfiguration('other-name', $appPath, $lockPath))
@@ -1006,6 +1164,33 @@ test('laravel manager reconnect rebuilds fair coordination around the fresh eage
     expect($connection->table('writes')->value('value'))->toBe('after-reconnect');
 });
 
+test('a disconnected fair connection reconnects before the next write acquisition', function (): void {
+    $workspace = $this->workspace.'/automatic-reconnect';
+    mkdir($workspace, 0775, true);
+    $appPath = $workspace.'/app.sqlite';
+    touch($appPath);
+    $name = 'automatic-reconnect-'.str_replace('.', '-', uniqid('', true));
+    config()->set('database.connections.'.$name, [
+        'driver' => 'fair-sqlite',
+        'database' => $appPath,
+        'prefix' => '',
+        'lock_directory' => $workspace.'/lock',
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+    ]);
+
+    $connection = app('db')->connection($name);
+    expect($connection)->toBeInstanceOf(FairSQLiteConnection::class);
+    $connection->unprepared('CREATE TABLE writes (value TEXT NOT NULL)');
+    $connection->disconnect();
+
+    $connection->statement('INSERT INTO writes (value) VALUES (?)', ['automatic-reconnect']);
+
+    expect($connection->table('writes')->value('value'))->toBe('automatic-reconnect')
+        ->and($connection->transactionLevel())->toBe(0)
+        ->and($connection->getPdo()->inTransaction())->toBeFalse();
+});
+
 test('queued cleanup failure preserves commit rollback and callback priorities', function (string $outcome): void {
     Exceptions::fake();
     $workspace = $this->workspace.'/cleanup-'.$outcome;
@@ -1013,7 +1198,7 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
     $appPath = $workspace.'/app.sqlite';
     touch($appPath);
     $lockPath = $workspace.'/lock';
-    $connection = (new FairSQLiteConnector())->connect([
+    $connection = (new FairSQLiteConnector)->connect([
         'driver' => 'fair-sqlite',
         'database' => $appPath,
         'prefix' => '',
@@ -1090,7 +1275,7 @@ test('debug logging reports representative bootstrap and ticket transitions', fu
     touch($appPath);
 
     Log::spy();
-    $connection = (new FairSQLiteConnector())->connect([
+    $connection = (new FairSQLiteConnector)->connect([
         'driver' => 'fair-sqlite',
         'database' => $appPath,
         'prefix' => '',

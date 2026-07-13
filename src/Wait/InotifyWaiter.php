@@ -4,9 +4,8 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
-use Illuminate\Support\Facades\Log;
 use RuntimeException;
-use Throwable;
+use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 
 /**
  * Uses Linux directory events as bounded wake hints for lock-state checks.
@@ -95,7 +94,7 @@ final class InotifyWaiter implements Waiter
         if ($watch === false) {
             if ($this->allowPostArmPolling && $this->armedOnce) {
                 $this->degraded = true;
-                $this->debugDegradation('arm');
+                FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'inotify', 'operation' => 'arm', 'fallback' => 'polling']);
 
                 return;
             }
@@ -137,7 +136,7 @@ final class InotifyWaiter implements Waiter
     public function block(?float $deadline, callable $monotonic): void
     {
         if ($this->degraded) {
-            ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
+            ($this->polling ??= new PollingWaiter)->block($deadline, $monotonic);
 
             return;
         }
@@ -154,20 +153,9 @@ final class InotifyWaiter implements Waiter
                 throw new RuntimeException('The inotify wait failed after the watch was armed.');
             }
             $this->degraded = true;
-            $this->debugDegradation('block');
-            ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
-        }
-    }
+            FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'inotify', 'operation' => 'block', 'fallback' => 'polling']);
 
-    /** Emit the single diagnostic allowed for automatic native degradation. */
-    private function debugDegradation(string $operation): void
-    {
-        if ($this->debug) {
-            try {
-                Log::debug('Fair SQLite transition.', ['event' => 'waiter_degraded', 'pid' => getmypid(), 'adapter' => 'inotify', 'operation' => $operation, 'fallback' => 'polling']);
-            } catch (Throwable) {
-                // Optional diagnostics must never change waiter degradation.
-            }
+            return;
         }
     }
 }

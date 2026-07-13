@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Lock;
 
-use Illuminate\Support\Facades\Log;
 use PDO;
 use PDOStatement;
 use RuntimeException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
+use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
@@ -50,7 +50,7 @@ final class FairSQLiteLock
      * @param  Waiter  $waiter  Shared native or polling wait adapter.
      * @param  float  $staleHeadSeconds  Positive seconds before fenced stale-head revalidation.
      * @param  callable(Throwable): void  $onUnknownAppPdoOutcome  Marks an indeterminate app-PDO outcome.
-     * @param  callable(): void  $disconnect  Retires the affected application PDO.
+     * @param  callable(): void  $disconnect  Disconnects an application PDO whose timeout or transaction outcome is unsafe.
      * @param  (callable(): float)|null  $monotonic  Internal deterministic monotonic clock seam.
      * @param  bool  $debug  Whether abnormal transitions emit structured Laravel debug logs.
      * @return void The instance is ready to coordinate the supplied application PDO.
@@ -214,7 +214,7 @@ final class FairSQLiteLock
         if ($fenceHeld) {
             try {
                 $this->appPdo->rollBack();
-                $this->debug('lock_rollback', ['operation' => 'pre_business_abort']);
+                FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'pre_business_abort']);
             } catch (Throwable $rollback) {
                 $this->markUnknownOutcome($rollback);
                 report($rollback);
@@ -225,7 +225,7 @@ final class FairSQLiteLock
             try {
                 $this->cleanupOwnTicket($ownTicket);
             } catch (Throwable $cleanup) {
-                $this->debug('cleanup_failed', ['operation' => 'abort']);
+                FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'abort']);
                 report($cleanup);
             }
         }
@@ -273,7 +273,7 @@ final class FairSQLiteLock
             if ($this->appPdo->inTransaction()) {
                 try {
                     $this->appPdo->rollBack();
-                    $this->debug('lock_rollback', ['operation' => 'recovery_failure']);
+                    FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'recovery_failure']);
                 } catch (Throwable $rollback) {
                     $this->markUnknownOutcome($rollback);
                     report($rollback);
@@ -285,7 +285,7 @@ final class FairSQLiteLock
         $this->rollbackFenceKnown();
         $this->resetObservation();
         if ($recovered) {
-            $this->debug('stale_head_recovered', ['head_ticket' => $observedHead]);
+            FairSQLiteDebug::log($this->debug, 'stale_head_recovered', ['head_ticket' => $observedHead]);
         }
     }
 
@@ -299,7 +299,7 @@ final class FairSQLiteLock
     {
         // An absent/reclaimed ticket is not deleted again; a fresh committed ticket joins the tail.
         $newTicket = $this->lockDatabase->admit($deadline);
-        $this->debug('ticket_requeued', ['lost_ticket' => $ticket, 'new_ticket' => $newTicket]);
+        FairSQLiteDebug::log($this->debug, 'ticket_requeued', ['lost_ticket' => $ticket, 'new_ticket' => $newTicket]);
 
         return $newTicket;
     }
@@ -308,8 +308,10 @@ final class FairSQLiteLock
      * Attempts BEGIN IMMEDIATE once and restores the caller's busy timeout.
      *
      * Numeric BUSY or LOCKED means the fence was not acquired and returns false.
-     * Every other failure escapes; a restore failure rolls back a newly acquired
-     * fence and marks an unsuccessful rollback as an unknown PDO outcome.
+     * Every other failure escapes. After a restore failure, this method first
+     * rolls back a newly acquired fence and retries the idempotent restore outside
+     * that transaction. A second restore failure disconnects the unsafe PDO; an
+     * unsuccessful rollback remains an unknown PDO outcome.
      */
     private function tryAppFence(): bool
     {
@@ -329,19 +331,33 @@ final class FairSQLiteLock
                 if (! LockDatabase::isBusyOrLocked($exception)) {
                     throw $exception;
                 }
-                $this->debug('lock_retry', ['operation' => 'app_fence']);
+                FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'app_fence']);
             }
         } finally {
             try {
                 $this->appPdo->exec('PRAGMA busy_timeout='.$busyTimeout);
             } catch (Throwable $restore) {
+                $rollbackKnown = true;
                 if ($began) {
                     try {
                         $this->appPdo->rollBack();
-                        $this->debug('lock_rollback', ['operation' => 'busy_timeout_restore']);
+                        FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'busy_timeout_restore']);
                     } catch (Throwable $rollback) {
+                        $rollbackKnown = false;
                         $this->markUnknownOutcome($rollback);
                         report($rollback);
+                    }
+                }
+                if ($rollbackKnown) {
+                    try {
+                        $this->appPdo->exec('PRAGMA busy_timeout='.$busyTimeout);
+                    } catch (Throwable $secondRestore) {
+                        report($secondRestore);
+                        try {
+                            ($this->disconnect)();
+                        } catch (Throwable $disconnect) {
+                            report($disconnect);
+                        }
                     }
                 }
                 throw $restore;
@@ -355,7 +371,7 @@ final class FairSQLiteLock
     {
         try {
             $this->appPdo->rollBack();
-            $this->debug('lock_rollback', ['operation' => 'app_fence']);
+            FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'app_fence']);
         } catch (Throwable $exception) {
             $this->markUnknownOutcome($exception);
             throw $exception;
@@ -382,7 +398,7 @@ final class FairSQLiteLock
     {
         $clock = $this->monotonic;
         if ($deadline !== null && $clock() >= $deadline) {
-            $this->debug('wait_timeout', ['operation' => 'writer_wait']);
+            FairSQLiteDebug::log($this->debug, 'wait_timeout', ['operation' => 'writer_wait']);
             throw new FairWaitTimeoutException('The SQLite fair writer wait deadline expired.');
         }
     }
@@ -406,7 +422,7 @@ final class FairSQLiteLock
 
     private function markUnknownOutcome(Throwable $rollback): void
     {
-        $this->debug('unknown_pdo_outcome', ['operation' => 'app_rollback']);
+        FairSQLiteDebug::log($this->debug, 'unknown_pdo_outcome', ['operation' => 'app_rollback']);
         try {
             ($this->onUnknownAppPdoOutcome)($rollback);
         } catch (Throwable $guardFailure) {
@@ -427,22 +443,5 @@ final class FairSQLiteLock
         }
 
         return $statement;
-    }
-
-    /**
-     * Emit one structured diagnostic for a real writer-state transition.
-     *
-     * @param  string  $event  Stable event identifier from the package logging contract.
-     * @param  array<string, int|string>  $context  Secret-free identifiers describing the transition.
-     */
-    private function debug(string $event, array $context = []): void
-    {
-        if ($this->debug) {
-            try {
-                Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
-            } catch (Throwable) {
-                // Optional diagnostics must never change lock ownership or retry behavior.
-            }
-        }
     }
 }

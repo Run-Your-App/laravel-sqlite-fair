@@ -11,11 +11,14 @@ use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use Throwable;
 
 /**
- * Builds validated Laravel SQLite connections for the `fair-sqlite` driver.
+ * Creates Laravel SQLite connections for the `fair-sqlite` driver.
  *
- * Memory databases stay on Laravel's upstream lifecycle. File-backed databases
- * receive validated fair configuration and deterministic application/lock path
- * identities before the application PDO is opened.
+ * Memory databases keep Laravel's standard connection lifecycle. File-backed
+ * databases receive validated fair settings and stable filesystem identities
+ * before Laravel opens the application PDO. `realpath()` resolves symlinks and
+ * dot segments for both paths. The canonical database path becomes Laravel's
+ * effective configuration and PDO path; lock-directory derivation remains an
+ * explicit application decision.
  *
  * @internal Laravel applications use this connector through `FairSQLiteServiceProvider`.
  */
@@ -24,9 +27,10 @@ final class FairSQLiteConnector
     /**
      * Creates the configured Laravel connection.
      *
-     * Memory DSNs bypass fair-only validation and return Laravel's upstream connection. File databases merge package
-     * defaults with connection overrides, validate their canonical application/lock identity before opening PDO, and
-     * return a `FairSQLiteConnection` using Laravel's normal SQLite PDO options.
+     * Memory DSNs bypass fair-only validation and return Laravel's standard
+     * connection. File databases merge package defaults with connection
+     * overrides, replace existing paths with their canonical filesystem targets,
+     * and return a `FairSQLiteConnection` with Laravel's normal SQLite PDO options.
      *
      * @param  array<string, mixed>  $config  Laravel connection values plus optional fair overrides.
      * @param  string  $name  Stable Laravel connection name used by the process-local identity guard.
@@ -51,14 +55,14 @@ final class FairSQLiteConnector
 
         // Laravel memory DSNs deliberately bypass every fair-only capability and configuration check.
         if ($this->isMemoryDatabase($database)) {
-            $pdo = (new SQLiteConnector())->connect($config);
+            $pdo = (new SQLiteConnector)->connect($config);
 
             return new SQLiteConnection($pdo, $database, $prefix, $config);
         }
 
         $fairConfig = $this->fairConfig($config);
-        $appPath = $this->canonicalExistingPath($database, 'database');
-        $lockPath = $this->canonicalLockDirectory($fairConfig['lock_directory']);
+        $appPath = $this->resolveDatabasePath($database);
+        $lockPath = $this->resolveLockDirectory($fairConfig['lock_directory']);
 
         FairSQLiteConnection::assertIdentityConfiguration($name, $appPath, $lockPath);
         FairSQLiteConnection::assertIdentityIsUsable($name, $appPath, $lockPath);
@@ -67,7 +71,7 @@ final class FairSQLiteConnector
             'database' => $appPath,
             'name' => $name,
         ]);
-        $pdo = (new SQLiteConnector())->connect($config);
+        $pdo = (new SQLiteConnector)->connect($config);
 
         return new FairSQLiteConnection($pdo, $appPath, $prefix, $config, $appPath, $lockPath);
     }
@@ -128,28 +132,47 @@ final class FairSQLiteConnector
         ];
     }
 
-    private function canonicalExistingPath(string $path, string $label): string
+    /**
+     * Resolves the existing application database to its stable filesystem identity.
+     *
+     * @param  string  $path  Absolute path configured for the SQLite database.
+     * @return string The filesystem-resolved database path used by PDO and the identity guard.
+     *
+     * @throws FairSQLiteException When the path is relative, missing, or cannot be resolved.
+     */
+    private function resolveDatabasePath(string $path): string
     {
-        $this->assertAbsolutePath($path, $label);
-        $canonical = realpath($path);
-        if ($canonical === false) {
-            throw new FairSQLiteException("The SQLite {$label} path [{$path}] does not exist.");
+        $this->assertAbsolutePath($path, 'database');
+        $resolved = realpath($path);
+        if ($resolved === false) {
+            throw new FairSQLiteException("The SQLite database path [{$path}] does not exist.");
         }
 
-        return $canonical;
+        return $resolved;
     }
 
-    /** Resolve the single lock-directory filesystem boundary. */
-    private function canonicalLockDirectory(string $path): string
+    /**
+     * Prepares and resolves the dedicated lock directory.
+     *
+     * Directory creation remains owned by `LockDatabase`; this connector only
+     * validates the configured path and records its stable filesystem identity.
+     *
+     * @param  string  $path  Absolute directory configured for this database's lock state.
+     * @return string The filesystem-resolved directory used by the lock owner and identity guard.
+     *
+     * @throws FairSQLiteException When the path is relative or cannot be resolved after creation.
+     * @throws Throwable When the lock owner cannot create the directory.
+     */
+    private function resolveLockDirectory(string $path): string
     {
         $this->assertAbsolutePath($path, 'lock directory');
         LockDatabase::prepareDirectory($path);
-        $canonical = realpath($path);
-        if ($canonical === false) {
+        $resolved = realpath($path);
+        if ($resolved === false) {
             throw new FairSQLiteException("The SQLite lock directory path [{$path}] could not be resolved.");
         }
 
-        return $canonical;
+        return $resolved;
     }
 
     private function assertAbsolutePath(string $path, string $label): void

@@ -8,9 +8,12 @@ return [
     | Lock Directory
     |--------------------------------------------------------------------------
     |
-    | This absolute directory stores the private lock.sqlite ticket database
-    | and is watched by the native waiter. Each file-backed application
-    | database must resolve to one dedicated lock directory.
+    | Absolute directory that contains this database's private `lock.sqlite`
+    | ticket database. Native waiters observe this directory for wake hints.
+    |
+    | Give every application database its own directory, and configure the same
+    | directory in every cooperating web, queue, scheduler, and CLI process.
+    | The directory may be absent at startup; the package creates it lazily.
     |
     */
     'lock_directory' => storage_path('app/private/sqlite-fair'),
@@ -20,9 +23,12 @@ return [
     | Stale Queue Head Threshold
     |--------------------------------------------------------------------------
     |
-    | This positive finite number of seconds controls when an unchanged foreign
-    | queue head may be checked under the real application writer fence and
-    | recovered. Strings and non-finite numbers are never coerced.
+    | Positive, finite number of seconds an unchanged foreign queue head must
+    | remain visible before another writer may verify it under the application
+    | writer fence and recover it. This is not a ticket lifetime or heartbeat.
+    |
+    | Use an integer or float. Numeric strings, zero, negative values, NAN, and
+    | infinity are rejected instead of being coerced.
     |
     */
     'stale_head_seconds' => 10.0,
@@ -32,9 +38,9 @@ return [
     | Writer Wait Strategy
     |--------------------------------------------------------------------------
     |
-    | Supported values are "auto", "native", and "polling". Auto selects the
-    | host-native waiter where required, native rejects unsupported hosts, and
-    | polling explicitly uses bounded polling.
+    | `auto` selects Inotify on Linux/WSL, FFI-kqueue on macOS, and polling on
+    | native Windows. `native` requires the host-native adapter and fails when
+    | that capability is unavailable. `polling` always uses bounded polling.
     |
     */
     'wait_strategy' => 'auto',
@@ -44,9 +50,13 @@ return [
     | Runtime Debug Logging
     |--------------------------------------------------------------------------
     |
-    | Enable this boolean only when structured diagnostics for contention and
-    | abnormal lock transitions are needed. Normal acquisition, wakeup, ticket
-    | consumption, commit, and rollback paths remain silent.
+    | Set this boolean to true for lean, structured diagnostics when contention
+    | creates a ticket or the runtime retries, rolls back, times out, bootstraps,
+    | degrades a native waiter, or enters another abnormal transition.
+    |
+    | Normal direct writes, wakeups, ticket consumption, successful commits,
+    | and other expected queue progress remain silent. Logging failures never
+    | change lock ownership or application outcomes.
     |
     */
     'debug' => false,

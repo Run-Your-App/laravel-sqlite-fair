@@ -5,24 +5,27 @@ declare(strict_types=1);
 namespace RunYourApp\LaravelSqliteFair\Laravel;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\DeadlockException;
 use Illuminate\Database\SQLiteConnection;
-use Illuminate\Support\Facades\Log;
 use LogicException;
 use PDO;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Lock\FairSQLiteLock;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
+use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use RunYourApp\LaravelSqliteFair\Wait\WaiterFactory;
 use Throwable;
 
 /**
  * Coordinates every file-backed Laravel write through one fair SQLite lifecycle.
  *
- * `FairSQLiteConnector` creates this connection for the `fair-sqlite` driver. Application code keeps using Laravel's
- * callback, manual, statement, query-builder, and Eloquent APIs while this class owns their shared ticket, application
- * fence, cleanup, bounded wait, and unknown-PDO retirement state.
+ * `FairSQLiteConnector` creates this connection for the `fair-sqlite` driver.
+ * Application code keeps using Laravel's callback, manual, statement,
+ * query-builder, and Eloquent APIs. This class owns the shared ticket,
+ * application fence, cleanup, bounded wait, and unknown-PDO retirement state
+ * behind those familiar APIs.
  */
 final class FairSQLiteConnection extends SQLiteConnection
 {
@@ -205,7 +208,8 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * An outer transaction acquires the application writer fence before invoking the callback; nested transactions use
      * Laravel savepoints under that acquisition. Laravel-classified callback concurrency failures may repeat only after
-     * a known successful rollback and cleanup. Commit and unknown rollback outcomes are never replayed.
+     * a known successful rollback and cleanup. Nested concurrency failures roll back their savepoint before escaping
+     * without retry. Commit and unknown rollback outcomes are never replayed.
      *
      * @template TReturn
      *
@@ -224,8 +228,7 @@ final class FairSQLiteConnection extends SQLiteConnection
                 $result = $callback($this);
             } catch (Throwable $exception) {
                 if ($this->causedByConcurrencyError($exception) && $this->transactions > 1) {
-                    $this->transactions--;
-                    $this->transactionsManager?->rollback($this->connectionName(), $this->transactions);
+                    $this->rollBack();
 
                     throw new DeadlockException(
                         $exception->getMessage(),
@@ -264,7 +267,8 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * The outer level acquires and holds one application writer fence with an optional queue ticket before Laravel's
      * transaction manager and beginning event are updated. Nested levels create savepoints without a second ticket. A
-     * pre-business setup failure leaves no installed local fair scope.
+     * disconnected outer connection is reconnected before acquisition. A pre-business setup failure leaves no
+     * installed local fair scope or completed transaction-manager record.
      *
      * @return void The transaction is active and represented in Laravel's transaction state.
      *
@@ -281,9 +285,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         }
 
         if ($this->pretending()) {
-            $this->transactions++;
-            $this->transactionsManager?->begin($this->connectionName(), $this->transactions);
-            $this->fireConnectionEvent('beganTransaction');
+            $this->beginFrameworkTransactionLevel();
 
             return;
         }
@@ -297,23 +299,33 @@ final class FairSQLiteConnection extends SQLiteConnection
                 $this->retireUnknownOutcome($exception);
                 throw $exception;
             }
-            $this->transactions++;
-            $this->transactionsManager?->begin($this->connectionName(), $this->transactions);
-            $this->fireConnectionEvent('beganTransaction');
+            $this->beginFrameworkTransactionLevel();
 
             return;
         }
 
+        $this->reconnectIfMissingConnection();
         $ticket = $this->fairLock()->acquire($this->consumeWaitDeadline());
         $this->activeTicket = $ticket;
         $this->fairFenceHeld = true;
+        $managerBeginAttempted = false;
         try {
             $this->transactions++;
-            $this->transactionsManager?->begin($this->connectionName(), $this->transactions);
+            if ($this->transactionsManager !== null) {
+                $managerBeginAttempted = true;
+                $this->transactionsManager->begin($this->connectionName(), $this->transactions);
+            }
             $this->fireConnectionEvent('beganTransaction');
         } catch (Throwable $exception) {
             $this->transactions = 0;
             $this->abortInstalledScope();
+            if ($managerBeginAttempted && ! $this->hasUnknownPdoOutcome()) {
+                try {
+                    $this->transactionsManager?->rollback($this->connectionName(), 0);
+                } catch (Throwable $managerRollback) {
+                    report($managerRollback);
+                }
+            }
             throw $exception;
         }
     }
@@ -521,7 +533,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         try {
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
-            $this->debug('cleanup_failed', ['operation' => 'non_transactional']);
+            FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'non_transactional']);
             report($cleanup);
         }
         $this->clearFairScope();
@@ -583,7 +595,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * Pretend transactions update only Laravel's temporary transaction and query-log state. They do not open the lock
      * database, acquire a fence, create a ticket, or persist application SQL.
      *
-     * @param  Closure(\Illuminate\Database\Connection): mixed  $callback  Laravel query operations to record without execution.
+     * @param  Closure(Connection): mixed  $callback  Laravel query operations to record without execution.
      * @return array<int, array{query: string, bindings: array<array-key, mixed>, time: float|null}> Recorded Laravel query log.
      *
      * @throws FairSQLiteException When the connection identity has already been retired.
@@ -769,7 +781,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         $clock = $this->monotonic;
         $deadline = (float) $this->waitScopeDeadline;
         if ($deadline <= $clock()) {
-            $this->debug('wait_timeout', ['operation' => 'wait_scope']);
+            FairSQLiteDebug::log($this->debug, 'wait_timeout', ['operation' => 'wait_scope']);
             throw new FairWaitTimeoutException('The SQLite fair writer wait deadline expired.');
         }
 
@@ -794,6 +806,33 @@ final class FairSQLiteConnection extends SQLiteConnection
         $this->fireConnectionEvent('committed');
     }
 
+    /**
+     * Installs one nested or pretend Laravel transaction level atomically.
+     *
+     * A manager or `beganTransaction` listener failure restores the preceding
+     * level through the normal rollback owner. Nested calls therefore remove the
+     * savepoint and its callbacks; pretend calls restore only temporary framework
+     * state. Cleanup failures are secondary to the original setup failure.
+     */
+    private function beginFrameworkTransactionLevel(): void
+    {
+        $previousLevel = $this->transactions;
+        $this->transactions++;
+
+        try {
+            $this->transactionsManager?->begin($this->connectionName(), $this->transactions);
+            $this->fireConnectionEvent('beganTransaction');
+        } catch (Throwable $exception) {
+            try {
+                $this->rollBack($previousLevel);
+            } catch (Throwable $rollback) {
+                report($rollback);
+            }
+
+            throw $exception;
+        }
+    }
+
     private function abortInstalledScope(): void
     {
         $this->fairLock()->abortBeforeBusiness($this->fairFenceHeld, $this->activeTicket);
@@ -805,7 +844,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         try {
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
-            $this->debug('cleanup_failed', ['operation' => 'persisted_success']);
+            FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'persisted_success']);
             report($cleanup);
         }
         $this->clearFairScope();
@@ -817,7 +856,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         try {
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
-            $this->debug('cleanup_failed', ['operation' => 'original_failure']);
+            FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'original_failure']);
             report($cleanup);
         }
         $this->clearFairScope();
@@ -841,14 +880,14 @@ final class FairSQLiteConnection extends SQLiteConnection
     private function retireUnknownOutcome(Throwable $primary): void
     {
         $fairLock = $this->fairLock;
-        $this->debug('unknown_pdo_outcome', ['operation' => 'app_pdo']);
+        FairSQLiteDebug::log($this->debug, 'unknown_pdo_outcome', ['operation' => 'app_pdo']);
         $this->markUnknownPdoOutcome($primary);
         $this->disconnectAfterUnknownOutcome();
         if ($this->activeTicket !== null && $fairLock !== null) {
             try {
                 $fairLock->cleanupOwnTicket($this->activeTicket);
             } catch (Throwable $cleanup) {
-                $this->debug('cleanup_failed', ['operation' => 'unknown_outcome']);
+                FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'unknown_outcome']);
                 report($cleanup);
             }
         }
@@ -914,7 +953,11 @@ final class FairSQLiteConnection extends SQLiteConnection
             $waiter,
             $this->staleHeadSeconds,
             fn (Throwable $exception): null => $this->markUnknownPdoOutcome($exception),
-            fn (): null => $this->disconnectAfterUnknownOutcome(),
+            function (): null {
+                $this->disconnect();
+
+                return null;
+            },
             $clock,
             $this->debug,
         );
@@ -941,22 +984,5 @@ final class FairSQLiteConnection extends SQLiteConnection
     private static function identityKey(string $name, string $appPath, string $lockPath): string
     {
         return hash('sha256', $name."\0".$appPath."\0".$lockPath);
-    }
-
-    /**
-     * Emit one structured diagnostic for a real connection-state transition.
-     *
-     * @param  string  $event  Stable event identifier from the package logging contract.
-     * @param  array<string, int|string>  $context  Secret-free identifiers describing the transition.
-     */
-    private function debug(string $event, array $context = []): void
-    {
-        if ($this->debug) {
-            try {
-                Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
-            } catch (Throwable) {
-                // Optional diagnostics must never change the connection lifecycle.
-            }
-        }
     }
 }

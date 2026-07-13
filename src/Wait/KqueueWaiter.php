@@ -5,22 +5,50 @@ declare(strict_types=1);
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
 use FFI;
-use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use Throwable;
 
 /**
  * Uses Darwin vnode events as bounded wake hints for lock-state checks.
  *
- * WaiterFactory delegates Darwin capability detection to this class so the C ABI,
- * constants, queue handles and system calls have one owner. The adapter observes
- * only the lock directory; FairSQLiteLock still decides whether state changed.
+ * PHP 8.4 and Laravel expose no kqueue, FSEvents, or vnode-watch API. This class
+ * therefore owns one deliberately small FFI boundary instead of starting an
+ * external watcher process or adding a second runtime. `WaiterFactory` delegates
+ * Darwin capability detection here so the C declaration, constants, descriptors,
+ * and system calls cannot drift across owners.
+ *
+ * The adapter observes only the lock directory and treats events as wake hints.
+ * `FairSQLiteLock` remains the sole owner of queue and writer-fence decisions.
  *
  * @internal
  */
 final class KqueueWaiter implements Waiter
 {
-    private const C_DEFINITIONS = 'typedef unsigned long uintptr_t; typedef long intptr_t; typedef unsigned int uint32_t; struct kevent { uintptr_t ident; short filter; unsigned short flags; uint32_t fflags; intptr_t data; void *udata; }; struct timespec { long tv_sec; long tv_nsec; }; int kqueue(void); int kevent(int, const struct kevent *, int, struct kevent *, int, const struct timespec *); int open(const char *, int, ...); int close(int);';
+    private const C_DEFINITIONS = <<<'C'
+        typedef unsigned long uintptr_t;
+        typedef long intptr_t;
+        typedef unsigned int uint32_t;
+
+        struct kevent {
+            uintptr_t ident;
+            short filter;
+            unsigned short flags;
+            uint32_t fflags;
+            intptr_t data;
+            void *udata;
+        };
+
+        struct timespec {
+            long tv_sec;
+            long tv_nsec;
+        };
+
+        int kqueue(void);
+        int kevent(int, const struct kevent *, int, struct kevent *, int, const struct timespec *);
+        int open(const char *, int, ...);
+        int close(int);
+        C;
 
     private const EVFILT_VNODE = -4;
 
@@ -85,16 +113,22 @@ final class KqueueWaiter implements Waiter
             throw new RuntimeException('The lock directory kqueue handles could not be opened.');
         }
 
-        $this->arm();
-        $this->drain();
+        try {
+            $this->arm();
+            $this->drain();
+        } catch (Throwable $exception) {
+            $this->close();
+            throw $exception;
+        }
     }
 
     /**
      * Closes the directory and kqueue descriptors owned by this adapter.
      *
-     * @return void Both owned descriptors have been closed.
+     * Cleanup is best effort: each descriptor is released independently, cleanup
+     * failures are diagnostics only, and destruction never masks an active error.
      *
-     * @throws RuntimeException When the configured system-call boundary cannot close a descriptor.
+     * @return void Descriptor ownership has been released by this adapter.
      */
     public function __destruct()
     {
@@ -151,7 +185,7 @@ final class KqueueWaiter implements Waiter
         if ($this->integerCall('kevent', $this->queue, FFI::addr($change), 1, null, 0, null) < 0) {
             if ($this->allowPostArmPolling && $this->armedOnce) {
                 $this->degraded = true;
-                $this->debugDegradation('arm');
+                FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'kqueue', 'operation' => 'arm', 'fallback' => 'polling']);
 
                 return;
             }
@@ -165,7 +199,8 @@ final class KqueueWaiter implements Waiter
      *
      * The wait lasts no longer than one tenth of a second or the supplied absolute
      * deadline. Auto mode switches permanently to polling after a post-arm native
-     * failure; native mode reports that failure to the lock owner.
+     * failure and begins polling in the next wait cycle; native mode reports that
+     * failure to the lock owner.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
@@ -176,7 +211,7 @@ final class KqueueWaiter implements Waiter
     public function block(?float $deadline, callable $monotonic): void
     {
         if ($this->degraded) {
-            ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
+            ($this->polling ??= new PollingWaiter)->block($deadline, $monotonic);
 
             return;
         }
@@ -192,8 +227,7 @@ final class KqueueWaiter implements Waiter
         if ($this->integerCall('kevent', $this->queue, null, 0, FFI::addr($event), 1, FFI::addr($timeout)) < 0) {
             if ($this->allowPostArmPolling) {
                 $this->degraded = true;
-                $this->debugDegradation('block');
-                ($this->polling ??= new PollingWaiter())->block($deadline, $monotonic);
+                FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'kqueue', 'operation' => 'block', 'fallback' => 'polling']);
 
                 return;
             }
@@ -230,7 +264,7 @@ final class KqueueWaiter implements Waiter
             }
             if ($this->allowPostArmPolling) {
                 $this->degraded = true;
-                $this->debugDegradation('drain');
+                FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'kqueue', 'operation' => 'drain', 'fallback' => 'polling']);
 
                 return;
             }
@@ -288,13 +322,25 @@ final class KqueueWaiter implements Waiter
 
     private function close(): void
     {
-        if ($this->directoryHandle >= 0) {
-            $this->integerCall('close', $this->directoryHandle);
-            $this->directoryHandle = -1;
+        $this->closeDescriptor($this->directoryHandle, 'close_directory');
+        $this->closeDescriptor($this->queue, 'close_queue');
+    }
+
+    /** Releases one descriptor without allowing cleanup to mask another failure. */
+    private function closeDescriptor(int &$descriptor, string $operation): void
+    {
+        $ownedDescriptor = $descriptor;
+        $descriptor = -1;
+        if ($ownedDescriptor < 0) {
+            return;
         }
-        if ($this->queue >= 0) {
-            $this->integerCall('close', $this->queue);
-            $this->queue = -1;
+
+        try {
+            if ($this->integerCall('close', $ownedDescriptor) < 0) {
+                FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['adapter' => 'kqueue', 'operation' => $operation]);
+            }
+        } catch (Throwable) {
+            FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['adapter' => 'kqueue', 'operation' => $operation]);
         }
     }
 
@@ -303,17 +349,5 @@ final class KqueueWaiter implements Waiter
         $systemCall = $this->systemCall;
 
         return $systemCall($this->ffi, $function, ...$arguments);
-    }
-
-    /** Emit the single diagnostic allowed for automatic native degradation. */
-    private function debugDegradation(string $operation): void
-    {
-        if ($this->debug) {
-            try {
-                Log::debug('Fair SQLite transition.', ['event' => 'waiter_degraded', 'pid' => getmypid(), 'adapter' => 'kqueue', 'operation' => $operation, 'fallback' => 'polling']);
-            } catch (Throwable) {
-                // Optional diagnostics must never change waiter degradation.
-            }
-        }
     }
 }

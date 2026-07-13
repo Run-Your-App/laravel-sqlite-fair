@@ -11,9 +11,10 @@ use Illuminate\Support\ServiceProvider;
 /**
  * Registers the Fair SQLite driver with a Laravel application.
  *
- * Laravel Composer discovery loads this provider. It merges the package defaults and attaches the `fair-sqlite`
- * connection factory to the application database manager, including when another provider resolved that manager
- * earlier in the same application boot.
+ * Laravel Composer discovery loads this provider. It merges the package defaults
+ * and attaches the `fair-sqlite` connection factory to the application database
+ * manager, including when another provider resolved that manager earlier in the
+ * same application boot.
  */
 final class FairSQLiteServiceProvider extends ServiceProvider
 {

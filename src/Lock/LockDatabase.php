@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Lock;
 
-use Illuminate\Support\Facades\Log;
 use PDO;
 use PDOException;
 use PDOStatement;
 use RuntimeException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
+use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
@@ -115,7 +115,7 @@ final class LockDatabase
      */
     public static function prepareDirectory(string $directory): void
     {
-        if (! is_dir($directory) && ! mkdir($directory, 0775, true) && ! is_dir($directory)) {
+        if (! is_dir($directory) && ! @mkdir($directory, 0775, true) && ! is_dir($directory)) {
             throw new RuntimeException("The SQLite fair lock directory [{$directory}] could not be created.");
         }
     }
@@ -165,7 +165,7 @@ final class LockDatabase
             $deadline,
         );
 
-        $this->debug('ticket_created', ['ticket' => $ticket]);
+        FairSQLiteDebug::log($this->debug, 'ticket_created', ['ticket' => $ticket]);
 
         return $ticket;
     }
@@ -246,9 +246,9 @@ final class LockDatabase
             if ($active && $pdo->inTransaction()) {
                 try {
                     $pdo->rollBack();
-                    $this->debug('lock_rollback', ['operation' => 'cleanup']);
+                    FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'cleanup']);
                 } catch (Throwable $rollback) {
-                    $this->debug('cleanup_failed', ['operation' => 'cleanup_rollback']);
+                    FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'cleanup_rollback']);
                     report($rollback);
                     $this->invalidate();
                 }
@@ -306,7 +306,7 @@ final class LockDatabase
         }, $deadline);
 
         if ($bootstrapped) {
-            $this->debug('lock_database_bootstrap');
+            FairSQLiteDebug::log($this->debug, 'lock_database_bootstrap');
         }
     }
 
@@ -397,7 +397,7 @@ final class LockDatabase
                 $this->waiter->arm();
                 $this->waiter->drain();
                 $this->assertBeforeDeadline($deadline);
-                $this->debug('lock_retry', ['operation' => 'statement']);
+                FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'statement']);
                 try {
                     return $operation();
                 } catch (Throwable $recheck) {
@@ -405,7 +405,7 @@ final class LockDatabase
                         throw $recheck;
                     }
                 }
-                $this->debug('lock_retry', ['operation' => 'statement']);
+                FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'statement']);
                 $this->waiter->block($deadline, $this->monotonic);
             }
         }
@@ -439,7 +439,7 @@ final class LockDatabase
                 if (! self::isBusyOrLocked($exception)) {
                     throw $exception;
                 }
-                $this->debug('lock_retry', ['operation' => 'begin_exclusive']);
+                FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'begin_exclusive']);
                 $this->waitAfterContention($deadline, $secondStatecheck);
 
                 continue;
@@ -450,15 +450,15 @@ final class LockDatabase
             } catch (Throwable $exception) {
                 try {
                     $pdo->rollBack();
-                    $this->debug('lock_rollback', ['operation' => 'mutation']);
+                    FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'mutation']);
                 } catch (Throwable $rollback) {
-                    $this->debug('cleanup_failed', ['operation' => 'mutation_rollback']);
+                    FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'mutation_rollback']);
                     report($rollback);
                     $this->invalidate();
                     throw $exception;
                 }
                 if (self::isBusyOrLocked($exception)) {
-                    $this->debug('lock_retry', ['operation' => 'mutation']);
+                    FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'mutation']);
                     $this->waitAfterContention($deadline, $secondStatecheck);
 
                     continue;
@@ -476,7 +476,7 @@ final class LockDatabase
     {
         $now = $this->monotonic;
         if ($deadline !== null && $now() >= $deadline) {
-            $this->debug('wait_timeout', ['operation' => 'lock_database']);
+            FairSQLiteDebug::log($this->debug, 'wait_timeout', ['operation' => 'lock_database']);
             throw new FairWaitTimeoutException('The SQLite fair lock deadline expired.');
         }
     }
@@ -492,36 +492,61 @@ final class LockDatabase
     {
         $secondStatecheck = false;
 
-        try {
-            while (true) {
+        while (true) {
+            try {
                 $this->assertBeforeDeadline($deadline);
+            } catch (FairWaitTimeoutException $exception) {
+                $this->rollbackActiveCommitAndThrow($pdo, $exception, 'commit_timeout');
+            }
+
+            try {
+                $pdo->commit();
+
+                return;
+            } catch (Throwable $exception) {
+                if (self::sqliteResultCode($exception) !== 5) {
+                    FairSQLiteDebug::log($this->debug, 'unknown_pdo_outcome', ['operation' => 'lock_commit']);
+                    $this->invalidate();
+                    throw $exception;
+                }
+
+                FairSQLiteDebug::log($this->debug, 'lock_retry', ['operation' => 'commit']);
                 try {
-                    $pdo->commit();
-
-                    return;
-                } catch (Throwable $exception) {
-                    if (self::sqliteResultCode($exception) !== 5) {
-                        $this->debug('unknown_pdo_outcome', ['operation' => 'lock_commit']);
-                        $this->invalidate();
-                        throw $exception;
-                    }
-
-                    $this->debug('lock_retry', ['operation' => 'commit']);
                     $this->waitAfterContention($deadline, $secondStatecheck);
+                } catch (Throwable $waitFailure) {
+                    $this->rollbackActiveCommitAndThrow($pdo, $waitFailure, 'commit_waiter_failure');
                 }
             }
-        } catch (FairWaitTimeoutException $exception) {
-            try {
-                $pdo->rollBack();
-                $this->debug('lock_rollback', ['operation' => 'commit_timeout']);
-            } catch (Throwable $rollback) {
-                $this->debug('cleanup_failed', ['operation' => 'commit_timeout_rollback']);
-                report($rollback);
-                $this->invalidate();
-            }
-
-            throw $exception;
         }
+    }
+
+    /**
+     * Roll back a mutation whose commit is still known to be active.
+     *
+     * A deadline or waiter failure occurs only after the commit returned numeric
+     * SQLite BUSY. The mutation must therefore end before the original failure can
+     * escape. A rollback failure is secondary, invalidates the handle, and never
+     * replaces the deadline or waiter failure seen by the caller.
+     *
+     * @param  PDO  $pdo  Lock-database handle with the active mutation.
+     * @param  Throwable  $primary  Deadline or waiter failure that must remain primary.
+     * @param  string  $operation  Stable diagnostic name for the rollback boundary.
+     * @return never This method always rethrows the primary failure after rollback handling.
+     *
+     * @throws Throwable Always rethrows the supplied primary failure.
+     */
+    private function rollbackActiveCommitAndThrow(PDO $pdo, Throwable $primary, string $operation): never
+    {
+        try {
+            $pdo->rollBack();
+            FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => $operation]);
+        } catch (Throwable $rollback) {
+            FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => $operation.'_rollback']);
+            report($rollback);
+            $this->invalidate();
+        }
+
+        throw $primary;
     }
 
     /**
@@ -639,23 +664,6 @@ final class LockDatabase
             return $statement->fetchColumn();
         } finally {
             $statement->closeCursor();
-        }
-    }
-
-    /**
-     * Emit one structured diagnostic for a real lock-state transition.
-     *
-     * @param  string  $event  Stable event identifier from the package logging contract.
-     * @param  array<string, int|string>  $context  Secret-free identifiers describing the transition.
-     */
-    private function debug(string $event, array $context = []): void
-    {
-        if ($this->debug) {
-            try {
-                Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
-            } catch (Throwable) {
-                // Optional diagnostics must never change lock ownership or retry behavior.
-            }
         }
     }
 }

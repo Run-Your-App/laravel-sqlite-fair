@@ -1,10 +1,12 @@
 # Laravel SQLite Fair
 
-Laravel SQLite Fair lets an uncontended writer acquire SQLite's single application writer slot directly. When contention is observed, a second SQLite database, `lock.sqlite`, coordinates participating writers through committed FIFO tickets. SQLite remains this application's strategic production database; fair contention handling, native wakeups, and Laravel transaction parity are long-term production architecture. Abandoned waiting tickets can be recovered so one stopped waiter cannot block everyone else.
+[![Tests](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/tests.yml/badge.svg)](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/tests.yml)
 
-Before a writer executes SQL, the driver acquires the application database's write lock and verifies that the writer still owns its turn. Web requests, queue workers, scheduled commands, and CLI processes can therefore share one SQLite database without racing into sporadic `database is locked` or `SQLITE_BUSY` errors. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
+Laravel SQLite Fair is a drop-in SQLite driver for Laravel applications where web requests, queue workers, scheduled commands, and CLI processes all write to the same database. Change the connection driver from `sqlite` to `fair-sqlite`, then keep using Eloquent, the query builder, transactions, queues, and scheduled commands as usual. When writes collide, the package gives participating writers a committed FIFO turn instead of leaving them to race into sporadic `database is locked` or `SQLITE_BUSY` errors.
 
-The package is a drop-in replacement for Laravel's SQLite driver: install it, change the connection driver from `sqlite` to `fair-sqlite`, and keep using the same Eloquent models, query builder calls, transactions, queues, and scheduled commands. Uncontended writes create no tickets: the driver reads the queue, acquires SQLite's writer slot once with nonblocking `BEGIN IMMEDIATE`, and reads the queue again while holding that fence. Only observed write contention starts ticketing. No call-site PRAGMAs, retry wrappers, or lock helpers are required.
+The normal fast path stays lean: an uncontended writer acquires SQLite's writer slot directly and creates no coordination ticket. Only observed contention activates the dedicated `lock.sqlite` queue. Before business SQL begins, the driver verifies that the writer still owns its turn; abandoned waiting tickets are recoverable so one stopped process cannot block everyone else. No call-site PRAGMAs, retry wrappers, or lock helpers are required.
+
+The package preserves Laravel's transaction behavior while adding fair cross-process coordination and native wakeups for Linux and macOS. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
 
 ## Requirements
 

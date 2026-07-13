@@ -1,0 +1,45 @@
+<?php
+
+declare(strict_types=1);
+
+use RunYourApp\LaravelSqliteFair\Wait\InotifyWaiter;
+
+it('arms and consumes real single and coalesced inotify directory events on linux', function (int $events) {
+    if (PHP_OS_FAMILY !== 'Linux') {
+        $this->markTestSkipped('The real inotify smoke belongs to Linux hosts.');
+    }
+
+    expect(function_exists('inotify_init'))->toBeTrue();
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/inotify-'.$events;
+    mkdir($directory, 0775, true);
+    $blockedResult = null;
+    $select = static function (array &$read, array &$write, array &$except, int $seconds, int $microseconds) use (&$blockedResult, $directory, $events): int|false {
+        for ($event = 0; $event < $events; $event++) { touch($directory.'/event-'.$event); }
+        $blockedResult = stream_select($read, $write, $except, $seconds, $microseconds);
+        return $blockedResult;
+    };
+    $waiter = new InotifyWaiter($directory, false, $select);
+    $waiter->arm();
+    $waiter->drain();
+    $waiter->block(hrtime(true) / 1e9 + 0.1, static fn (): float => hrtime(true) / 1e9);
+
+    expect($blockedResult)->toBeGreaterThan(0);
+})->with([1, 3]);
+
+it('degrades only auto after a post-arm inotify failure', function (bool $auto) {
+    if (PHP_OS_FAMILY !== 'Linux') {
+        $this->markTestSkipped('The deterministic inotify failure proof belongs to Linux hosts.');
+    }
+    $directory = $GLOBALS['sqliteFairTestRunDirectory'].'/inotify-failure-'.($auto ? 'auto' : 'native');
+    mkdir($directory, 0775, true);
+    $waiter = new InotifyWaiter($directory, $auto);
+    rmdir($directory);
+
+    if ($auto) {
+        $waiter->arm();
+        $waiter->block(0.0, static fn (): float => 0.0);
+        expect(true)->toBeTrue();
+    } else {
+        expect(fn () => $waiter->arm())->toThrow(RuntimeException::class);
+    }
+})->with([true, false]);

@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Laravel ${{ matrix.laravel }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - laravel: '12.61.1'
+            composer-arguments: >-
+              --with laravel/framework:12.61.1
+              --with-all-dependencies
+              --prefer-stable
+          - laravel: latest
+            composer-arguments: >-
+              --with-all-dependencies
+              --prefer-stable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite, inotify
+          coverage: none
+          tools: composer:v2
+        env:
+          fail-fast: true
+
+      - name: Install dependencies
+        run: >-
+          composer update
+          ${{ matrix.composer-arguments }}
+          --no-interaction
+          --no-progress
+
+      - name: Review
+        run: composer review

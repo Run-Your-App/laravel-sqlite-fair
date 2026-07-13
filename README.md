@@ -9,7 +9,7 @@ The package is a drop-in replacement for Laravel's SQLite driver: install it, ch
 ## Requirements
 
 - PHP 8.4 or later
-- Laravel 12.61 or later, below Laravel 13
+- Laravel 12.61.1 or later, below Laravel 13
 - PDO and PDO SQLite
 - SQLite 3
 - Linux, including WSL: `ext-inotify`
@@ -21,7 +21,23 @@ Every cooperating process for one file-backed application database must see the 
 
 ## Installation
 
-The package currently lives inside this repository. The root `composer.json` registers `packages/laravel-sqlite-fair` as a path repository with `symlink: false`. From the repository root, install the development package version:
+The package is maintained in its own Git repository. Applications that keep a local checkout at `packages/laravel-sqlite-fair` can register it as a Composer path repository:
+
+```json
+{
+    "repositories": [
+        {
+            "type": "path",
+            "url": "packages/laravel-sqlite-fair",
+            "options": {
+                "symlink": false
+            }
+        }
+    ]
+}
+```
+
+Then install the development package version from the application root:
 
 ```bash
 composer require run-your-app/laravel-sqlite-fair:dev-main
@@ -33,7 +49,7 @@ Laravel then discovers the package service provider automatically. Publish the p
 php artisan vendor:publish --provider="RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteServiceProvider" --tag=sqlite-fair-config
 ```
 
-The published `config/sqlite-fair.php` becomes the application's single owner for package defaults. Connection-local values remain available only when one named database connection intentionally needs to override those application defaults. Extracting the package to an external repository is outside the current workflow.
+The published `config/sqlite-fair.php` becomes the application's single owner for package defaults. Connection-local values remain available only when one named database connection intentionally needs to override those application defaults.
 
 ## Configuration
 
@@ -65,9 +81,9 @@ Use the `fair-sqlite` driver for a file-backed SQLite connection:
 | `wait_strategy` | `auto` | Waiting backend: `auto`, `native`, or `polling`. |
 | `debug` | `false` | Structured debug logging for contention and abnormal runtime transitions. |
 
-Connection-local values override package defaults. `lock_directory` must be a non-empty absolute path, but the directory does not need to exist yet. The connector creates that directory through the lock database's existing filesystem owner and then uses `realpath()`; it does not lexically rewrite separators, `.` segments, or `..` segments and does not walk parent directories to synthesize a path. `stale_head_seconds` must be a finite positive integer or float, `wait_strategy` must be exactly `auto`, `native`, or `polling`, and `debug` must be a real boolean. No value is coerced from strings or integers. Use a different `lock_directory` for every application database, and use the same directory for all cooperating writers of that database. The package does not derive database identities or split a shared parent directory automatically.
+Connection-local values override package defaults. `lock_directory` must be a non-empty absolute path, but the directory does not need to exist yet. The lock owner creates it, then the connector applies `realpath()` to the existing application database and lock directory. This resolves symlinks plus `.` and `..` segments so filesystem aliases cannot bypass the process-local safety identity. The canonical application-database path replaces the configured value in the effective Laravel connection configuration and is passed to PDO; the canonical lock-directory path is used by the lock owner. The connector does not derive a lock directory or walk parent directories to synthesize one. `stale_head_seconds` must be a finite positive integer or float, `wait_strategy` must be exactly `auto`, `native`, or `polling`, and `debug` must be a real boolean. No value is coerced from strings or integers. Use a different `lock_directory` for every application database, and use the same directory for all cooperating writers of that database.
 
-This package does not own application tuning PRAGMAs. In this repository, `AppServiceProvider` remains the single owner of the existing SQLite bootstrap for every file-backed connection. Its existing raw-PDO ICU probe and fallback-function registration still run before its raw-PDO PRAGMA setup; these bootstrap methods are narrow static-guard exceptions and are not rewritten through Laravel Connection SQL methods. The configured `busy_timeout` (`10_000` ms in production and `1_000` ms locally/tests), `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `temp_store=MEMORY`, `mmap_size=268435456`, `wal_autocheckpoint=1000`, and `cache_size=-20000` remain unchanged. The eager, lazy-PDO-wrapper, `ConnectionEstablished`, and already-resolved-connection paths remain in place. A setup failure is still reported, logged once as `SQLite PRAGMA setup failed: ...`, and the connection is returned. Adding the Fair driver therefore does not change the application's tuning or its failure behavior.
+This package does not own application-database tuning PRAGMAs. The application remains responsible for settings such as `journal_mode`, `synchronous`, `foreign_keys`, cache sizing, ICU functions, and its normal `busy_timeout`. The Fair driver preserves Laravel's connection configuration and PDO setup instead of installing a second tuning owner.
 
 Immediately around each application `BEGIN IMMEDIATE`, the driver reads the currently active `busy_timeout`, sets it to `0`, performs exactly one nonblocking attempt, and restores the exact value it read on every exit. It does not impose or validate an application tuning value. A read, zeroing, or restore failure aborts before business SQL; an unknown fence rollback outcome activates the process-local Unknown-PDO-outcome guard. The driver does not run `PRAGMA optimize`.
 
@@ -184,7 +200,7 @@ The callback must start exactly one top-level fair write or one outer fair trans
 
 The deadline starts before the first head read and covers direct fence acquisition plus, only after contention is observed, ticket insertion, queue waiting, and stale-head recovery. It ends before business SQL and never interrupts running SQL. A timeout while holding a ticketless fence rolls back only that fence. A timeout after ticket admission additionally makes one best-effort exact attempt to remove only its own ticket. Both throw `FairWaitTimeoutException` and never retry the callback.
 
-Each application-fence attempt reads the connection's active `PRAGMA busy_timeout`, temporarily sets it to `0`, performs one nonblocking `BEGIN IMMEDIATE`, and restores the exact value read in `finally` on success, lock contention, and permanent failure. During direct acquisition, numeric SQLite `BUSY` or `LOCKED` starts ticket admission immediately and the direct attempt is never retried. Once queued, the waiter rechecks the exact queue condition around arm and drain, blocks for at most 0.1 seconds, and then lets the acquisition loop retry the applicable fence under the same absolute deadline. Read or zeroing failures stop before the begin attempt. If restoration fails after a fence began, the driver aborts and rolls the fence back; an unknown rollback outcome activates the process-local guard. The package never permanently changes the application's busy timeout.
+Each application-fence attempt reads the connection's active `PRAGMA busy_timeout`, temporarily sets it to `0`, performs one nonblocking `BEGIN IMMEDIATE`, and restores the exact value read in `finally` on success, lock contention, and permanent failure. During direct acquisition, numeric SQLite `BUSY` or `LOCKED` starts ticket admission immediately and the direct attempt is never retried. Once queued, the waiter rechecks the exact queue condition around arm and drain, blocks for at most 0.1 seconds, and then lets the acquisition loop retry the applicable fence under the same absolute deadline. Read or zeroing failures stop before the begin attempt. If restoration fails after a fence began, the driver rolls that fence back. After a known rollback it retries the exact idempotent restore outside the transaction; if this second restore also fails, the unsafe application PDO is disconnected before the original restore failure escapes. An unsuccessful rollback instead activates the process-local Unknown-PDO-outcome guard. The package never continues on a PDO whose busy timeout could not be restored.
 
 `FairWaitTimeoutException` extends `FairSQLiteException`.
 
@@ -259,7 +275,7 @@ composer review
 
 Polling multi-process tests always provide the safety and progress proof. Linux runs, including WSL, must execute the real Inotify test; macOS runs must execute the real kqueue test; native Windows proves polling. The wrong OS skips only the adapter that cannot exist there, while a missing native capability on Linux/WSL or macOS fails verification.
 
-The dependency gates cover Laravel 12.61 and the latest supported Laravel 12 release.
+The dependency gates cover Laravel 12.61.1 and the latest supported Laravel 12 release.
 
 ## License
 

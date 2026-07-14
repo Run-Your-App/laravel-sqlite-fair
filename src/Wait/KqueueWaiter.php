@@ -252,8 +252,6 @@ final class KqueueWaiter implements Waiter
         }
         $event = $this->ffi->new('struct kevent');
         $timeout = $this->ffi->new('struct timespec');
-        $timeout->tv_sec = 0;
-        $timeout->tv_nsec = 0;
         while (true) {
             $result = $this->integerCall('kevent', $this->queue, null, 0, FFI::addr($event), 1, FFI::addr($timeout));
             if ($result > 0) {

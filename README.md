@@ -170,7 +170,7 @@ The callback receives the active connection and must execute exactly one `statem
 - A lock-database commit with an unknown result is never replayed; the unusable handle is discarded.
 - Failures before business SQL roll back an active writer fence and make one bounded attempt to remove only the writer's own ticket. Cleanup failures never replace the original exception.
 - A crash before application commit lets SQLite roll back the transaction. A crash after business commit but before ticket deletion leaves a recoverable stale ticket; recovery never repeats the business callback.
-- An unknown application-PDO outcome disconnects that PDO and blocks the same database identity for the rest of the current process. Queue workers are marked to exit before another job.
+- An unknown application-PDO outcome disconnects that PDO and blocks the same database identity for the rest of the current process. The package does not register Laravel queue-worker lifecycle hooks.
 
 ## Destructive Restore and Wipe Boundary
 

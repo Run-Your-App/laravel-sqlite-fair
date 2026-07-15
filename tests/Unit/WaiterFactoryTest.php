@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Wait\InotifyWaiter;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
 use RunYourApp\LaravelSqliteFair\Wait\WaiterFactory;
@@ -35,7 +36,7 @@ it('selects the concrete strategy for the current host', function () {
         $native = WaiterFactory::make('native', $nativeDirectory);
         expect($native)->toBeInstanceOf($expected);
     } else {
-        expect(fn () => WaiterFactory::make('native', $nativeDirectory))->toThrow(RuntimeException::class);
+        expect(fn () => WaiterFactory::make('native', $nativeDirectory))->toThrow(FairSQLiteException::class);
     }
 });
 
@@ -44,7 +45,7 @@ it('fails linux native startup for a missing directory', function () {
         $this->markTestSkipped('Native startup failure belongs to Linux hosts.');
     }
     expect(fn () => WaiterFactory::make('native', $GLOBALS['sqliteFairTestRunDirectory'].'/missing-native-directory'))
-        ->toThrow(RuntimeException::class);
+        ->toThrow(FairSQLiteException::class);
 });
 
 it('backs polling off from 100 microseconds to the 100 millisecond cap', function () {
@@ -127,7 +128,7 @@ it('throws when the polling sleep fails without advancing backoff', function () 
     });
 
     $waiter->beginContention();
-    expect(fn () => $waiter->block(null, static fn (): float => 0.0))->toThrow(RuntimeException::class);
+    expect(fn () => $waiter->block(null, static fn (): float => 0.0))->toThrow(FairSQLiteException::class);
     $waiter->block(null, static fn (): float => 0.0);
 
     expect($intervals)->toBe([100, 100]);

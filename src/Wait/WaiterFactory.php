@@ -5,14 +5,14 @@ declare(strict_types=1);
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
 use InvalidArgumentException;
-use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 
 /**
  * Selects the wait adapter for the configured strategy and current host.
  *
- * FairSQLiteConnection uses this factory once per physical PDO lifecycle. The
- * factory owns platform policy, while InotifyWaiter owns the only native
- * operating-system boundary and PollingWaiter serves every other host.
+ * `FairSQLiteConnection` uses this factory once per physical PDO lifecycle.
+ * `InotifyWaiter` handles Linux filesystem notifications, while `PollingWaiter`
+ * serves every other host and explicit polling requests.
  *
  * @internal
  */
@@ -22,7 +22,7 @@ final class WaiterFactory
      * Reports the selected wait adapter for one operating-system family.
      *
      * Runtime capability checks consume this read-only matrix. The optional
-     * Inotify boolean is a deterministic test seam; production calls omit it so
+     * Inotify boolean lets tests describe unavailable Linux support; production calls omit it so
      * Linux checks the real extension while every non-Linux host reports polling.
      *
      * @param  string|null  $osFamily  PHP operating-system family, or null for the active host.
@@ -56,7 +56,7 @@ final class WaiterFactory
      * @return Waiter The selected and fully initialized wait adapter.
      *
      * @throws InvalidArgumentException When the strategy is not supported.
-     * @throws RuntimeException When the host lacks the requested native capability or adapter startup fails.
+     * @throws FairSQLiteException When the host lacks the requested native capability or adapter startup fails.
      */
     public static function make(string $strategy, string $directory, bool $debug = false): Waiter
     {
@@ -70,13 +70,13 @@ final class WaiterFactory
         $capabilities = self::capabilities();
         if ($capabilities['platform'] === 'other') {
             if ($strategy === 'native') {
-                throw new RuntimeException('Native waiting is supported only on Linux; select polling or auto.');
+                throw new FairSQLiteException('Native waiting is supported only on Linux; select polling or auto.');
             }
 
             return new PollingWaiter();
         }
         if (! $capabilities['available']) {
-            throw new RuntimeException('Native Linux waiting is unavailable because the inotify extension is missing.');
+            throw new FairSQLiteException('Native Linux waiting is unavailable because the inotify extension is missing.');
         }
 
         return new InotifyWaiter($directory, $strategy === 'auto', debug: $debug);

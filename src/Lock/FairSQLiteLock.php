@@ -6,23 +6,23 @@ namespace RunYourApp\LaravelSqliteFair\Lock;
 
 use PDO;
 use PDOStatement;
-use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
 /**
- * Owns writer-fence acquisition for one physical application PDO lifecycle.
+ * Acquires the SQLite writer fence for one physical application PDO.
  *
- * The connection owner calls this state machine before executing business writes.
+ * `FairSQLiteConnection` calls this state machine before executing business writes.
  * It attempts the application `BEGIN IMMEDIATE` fence directly while the ticket
  * queue is empty, then preserves FIFO order through LockDatabase after contention.
  * It also observes and recovers stale foreign heads only while holding the real
  * application writer fence.
  *
  * A successful acquisition returns while that application fence remains held. The
- * caller receives null for direct ownership or its committed queue ticket and is
+ * caller receives null for direct acquisition or its committed queue ticket and is
  * responsible for the later business commit, rollback, and ticket cleanup.
  *
  * @internal
@@ -51,11 +51,11 @@ final class FairSQLiteLock
      * @param  float  $staleHeadSeconds  Positive seconds before fenced stale-head revalidation.
      * @param  callable(Throwable): void  $onUnknownAppPdoOutcome  Marks an indeterminate app-PDO outcome.
      * @param  callable(): void  $disconnect  Disconnects an application PDO whose timeout or transaction outcome is unsafe.
-     * @param  (callable(): float)|null  $monotonic  Internal deterministic monotonic clock seam.
+     * @param  (callable(): float)|null  $monotonic  Optional monotonic clock used by deterministic tests.
      * @param  bool  $debug  Whether abnormal transitions emit structured Laravel debug logs.
      * @return void The instance is ready to coordinate the supplied application PDO.
      *
-     * @throws RuntimeException When the stale-head threshold is not positive.
+     * @throws FairSQLiteException When the stale-head threshold is not positive.
      *
      * @internal
      */
@@ -70,7 +70,7 @@ final class FairSQLiteLock
         private readonly bool $debug = false,
     ) {
         if ($staleHeadSeconds <= 0.0) {
-            throw new RuntimeException('SQLite fair stale-head seconds must be positive.');
+            throw new FairSQLiteException('SQLite fair stale-head seconds must be positive.');
         }
         $this->monotonic = $monotonic ?? static fn (): float => hrtime(true) / 1e9;
         $this->onUnknownAppPdoOutcome = $onUnknownAppPdoOutcome;
@@ -78,10 +78,13 @@ final class FairSQLiteLock
     }
 
     /**
-     * Acquire the application writer fence using direct-first fairness.
+     * Acquires the application writer fence using direct-first fairness.
+     *
+     * The method first proves that the ticket queue is empty. Contention joins the
+     * committed FIFO queue, and stale tickets are removed only after fenced revalidation.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
-     * @return int|null The committed queue ticket, or null for uncontended direct ownership.
+     * @return int|null The committed queue ticket, or null for an uncontended direct acquisition.
      *
      * @throws Throwable When acquisition, recovery, timeout, or abort cleanup fails.
      */
@@ -91,7 +94,10 @@ final class FairSQLiteLock
     }
 
     /**
-     * Acquire the application writer fence through the FIFO queue.
+     * Acquires the application writer fence through the FIFO queue.
+     *
+     * This forced path always creates a committed ticket and returns only while
+     * that ticket is the queue head and the application writer fence is held.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
      * @return int The committed queue ticket held by the caller.
@@ -102,7 +108,7 @@ final class FairSQLiteLock
     {
         $ticket = $this->acquireWithMode(true, $deadline);
         if ($ticket === null) {
-            throw new RuntimeException('Forced queued SQLite fair acquisition returned without a ticket.');
+            throw new FairSQLiteException('Forced queued SQLite fair acquisition returned without a ticket.');
         }
 
         return $ticket;
@@ -200,13 +206,13 @@ final class FairSQLiteLock
     }
 
     /**
-     * Abort a pre-business acquisition without replaying uncertain work.
+     * Aborts a pre-business acquisition without replaying uncertain work.
      *
      * Rollback and emergency ticket-cleanup failures are reported and converted to
-     * the connection's unknown-outcome handling; this boundary does not rethrow
+     * the connection's unknown-outcome handling; this method does not rethrow
      * them because it is already running while another acquisition failure escapes.
      *
-     * @param  bool  $fenceHeld  Whether this scope still owns the application writer fence.
+     * @param  bool  $fenceHeld  Whether this attempt still holds the application writer fence.
      * @param  int|null  $ownTicket  Committed ticket to clean once, or null for direct acquisition.
      * @return void Rollback and owned-ticket cleanup have each been attempted at most once.
      */
@@ -233,7 +239,7 @@ final class FairSQLiteLock
     }
 
     /**
-     * Perform the one permitted nonblocking cleanup for an owned ticket.
+     * Performs the one permitted nonblocking cleanup for an owned ticket.
      *
      * @param  int  $ownTicket  Committed ticket owned by the aborting connection.
      * @return void The cleanup attempt completed with a known outcome.
@@ -318,7 +324,7 @@ final class FairSQLiteLock
     {
         $value = $this->appQuery('PRAGMA busy_timeout')->fetchColumn();
         if ($value === false || ! is_numeric($value)) {
-            throw new RuntimeException('The application SQLite busy_timeout could not be read.');
+            throw new FairSQLiteException('The application SQLite busy_timeout could not be read.');
         }
         $busyTimeout = (int) $value;
         $this->appPdo->exec('PRAGMA busy_timeout=0');
@@ -372,7 +378,6 @@ final class FairSQLiteLock
     {
         try {
             $this->appPdo->rollBack();
-            FairSQLiteDebug::log($this->debug, 'lock_rollback', ['operation' => 'app_fence']);
         } catch (Throwable $exception) {
             $this->markUnknownOutcome($exception);
             throw $exception;
@@ -440,7 +445,7 @@ final class FairSQLiteLock
     {
         $statement = $this->appPdo->query($sql);
         if ($statement === false) {
-            throw new RuntimeException('The application SQLite query could not be prepared.');
+            throw new FairSQLiteException('The application SQLite query could not be prepared.');
         }
 
         return $statement;

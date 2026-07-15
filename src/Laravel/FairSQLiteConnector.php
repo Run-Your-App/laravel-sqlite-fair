@@ -84,7 +84,7 @@ final class FairSQLiteConnector
     }
 
     /**
-     * Merge and validate fair-only configuration without coercion.
+     * Merges and validates fair-only configuration without coercion.
      *
      * @param  array<string, mixed>  $connectionConfig  Connection values that may override package defaults.
      * @return array{lock_directory: string, stale_head_seconds: float|int, wait_strategy: 'auto'|'native'|'polling', debug: bool} Validated fair runtime values.
@@ -154,14 +154,14 @@ final class FairSQLiteConnector
     /**
      * Prepares and resolves the dedicated lock directory.
      *
-     * Directory creation remains owned by `LockDatabase`; this connector only
-     * validates the configured path and records its stable filesystem identity.
+     * `LockDatabase` creates the directory. This connector validates the configured
+     * path and records the resulting stable filesystem identity.
      *
      * @param  string  $path  Absolute directory configured for this database's lock state.
-     * @return string The filesystem-resolved directory used by the lock owner and identity guard.
+     * @return string The filesystem-resolved directory used by the ticket database and identity checks.
      *
      * @throws FairSQLiteException When the path is relative or cannot be resolved after creation.
-     * @throws Throwable When the lock owner cannot create the directory.
+     * @throws Throwable When `LockDatabase` cannot create the directory.
      */
     private function resolveLockDirectory(string $path): string
     {

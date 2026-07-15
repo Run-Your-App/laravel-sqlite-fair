@@ -23,7 +23,7 @@ use Throwable;
  *
  * `FairSQLiteConnector` creates this connection for the `fair-sqlite` driver.
  * Application code keeps using Laravel's callback, manual, statement,
- * query-builder, and Eloquent APIs. This class owns the shared ticket,
+ * query-builder, and Eloquent APIs. This class coordinates the shared ticket,
  * application fence, cleanup, bounded wait, and unknown-PDO retirement state
  * behind those familiar APIs.
  */
@@ -77,7 +77,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * The package connector supplies canonical application and lock paths plus validated waiter configuration. This
      * constructor rejects ambiguous or retired identities before installing the private lock database and host waiter.
-     * The optional clock exists only for deterministic package verification.
+     * Tests may supply the optional clock to verify deadline behavior without wall-clock delays.
      *
      * @param  PDO|Closure  $pdo  Eager application PDO or Laravel PDO resolver.
      * @param  string  $database  Canonical application database path used by Laravel.
@@ -85,8 +85,8 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @param  array<string, mixed>  $config  Validated Laravel and Fair SQLite connection values.
      * @param  string  $appPath  Canonical application database path used in the process identity.
      * @param  string  $lockPath  Canonical directory containing the private ticket database.
-     * @param  (callable(): float)|null  $monotonic  Optional monotonic seconds source for package verification.
-     * @return void The constructed connection owns its validated fair runtime immediately.
+     * @param  (callable(): float)|null  $monotonic  Optional monotonic seconds source used by deterministic tests.
+     * @return void The connection is ready with matching PDO and Fair SQLite coordination state.
      *
      * @throws FairSQLiteException When the name, identity, or fair configuration cannot be used safely.
      * @throws Throwable When PDO, lock-database bootstrap, or native waiter startup fails.
@@ -113,7 +113,7 @@ final class FairSQLiteConnection extends SQLiteConnection
 
         $strategy = $config['wait_strategy'] ?? null;
         $staleHeadSeconds = $config['stale_head_seconds'] ?? null;
-        // The public connector always supplies this validated value; false keeps the internal direct-construction seam quiet.
+        // The public connector always supplies this value; false keeps direct test construction quiet by default.
         $debug = $config['debug'] ?? false;
         if (! is_string($strategy)
             || (! is_int($staleHeadSeconds) && ! is_float($staleHeadSeconds))
@@ -129,14 +129,14 @@ final class FairSQLiteConnection extends SQLiteConnection
 
         $clock = $monotonic ?? static fn (): float => hrtime(true) / 1e9;
         $this->monotonic = $clock;
-        $this->installFairRuntime(parent::getPdo());
+        [$this->lockDatabase, $this->fairLock] = $this->buildFairRuntime(parent::getPdo());
     }
 
     /**
      * Registers one deterministic connection identity before PDO is opened.
      *
      * A connection name, application path, or lock path may belong to only one exact identity in the current process.
-     * The connector calls this guard before constructing PDO so aliases cannot create competing lock owners.
+     * The connector calls this check before constructing PDO so aliases cannot coordinate the same files differently.
      *
      * @param  string  $name  Non-empty Laravel connection name.
      * @param  string  $appPath  Canonical application database path.
@@ -191,8 +191,8 @@ final class FairSQLiteConnection extends SQLiteConnection
     /**
      * Reports whether this connection identity requires process recycling.
      *
-     * Long-running Laravel runtime owners consume this read-only status. Calling it does not open PDO, clear the
-     * process registry, or repair the retired connection.
+     * Queue workers and other long-running Laravel runtimes consume this read-only status. Calling it does not open
+     * PDO, clear the process registry, or repair the retired connection.
      *
      * @return bool Whether the current process must stop using this identity.
      *
@@ -430,7 +430,7 @@ final class FairSQLiteConnection extends SQLiteConnection
     }
 
     /**
-     * Executes a Laravel statement through fair writer ownership.
+     * Executes a Laravel statement through fair writer coordination.
      *
      * Outside a transaction the statement receives its own outer fair transaction. Inside a transaction it reuses the
      * active fence. Leading `BEGIN`, `COMMIT`, and `ROLLBACK` SQL is rejected before state changes.
@@ -449,7 +449,7 @@ final class FairSQLiteConnection extends SQLiteConnection
     }
 
     /**
-     * Executes an affecting Laravel statement through fair writer ownership.
+     * Executes an affecting Laravel statement through fair writer coordination.
      *
      * Outside a transaction the statement receives its own outer fair transaction; an active transaction reuses its
      * fence and optional ticket. Leading transaction-control SQL is rejected before execution.
@@ -468,7 +468,7 @@ final class FairSQLiteConnection extends SQLiteConnection
     }
 
     /**
-     * Executes one unprepared Laravel statement through fair writer ownership.
+     * Executes one unprepared Laravel statement through fair writer coordination.
      *
      * Outside a transaction the statement receives its own outer fair transaction. This method never splits SQL and
      * rejects only a leading `BEGIN`, `COMMIT`, or `ROLLBACK` token before execution.
@@ -706,8 +706,9 @@ final class FairSQLiteConnection extends SQLiteConnection
     /**
      * Replaces Laravel's PDO and installs matching Fair SQLite coordination state.
      *
-     * A concrete PDO receives a fresh waiter, lock-database handle, and application fence owner. A resolver or null
-     * clears the current fair runtime until Laravel supplies a concrete PDO. Retirement always blocks replacement.
+     * A concrete PDO receives a fresh waiter, lock-database handle, and application fence state before Laravel exposes
+     * that PDO. A resolver or null clears Fair SQLite state until Laravel supplies a concrete PDO. Retirement always
+     * blocks replacement.
      *
      * @param  PDO|Closure|null  $pdo  Concrete application PDO, deferred Laravel resolver, or null.
      * @return static This connection after replacing its PDO state.
@@ -719,10 +720,13 @@ final class FairSQLiteConnection extends SQLiteConnection
     {
         $this->assertUsable();
 
-        parent::setPdo($pdo);
         if ($pdo instanceof PDO) {
-            $this->installFairRuntime($pdo);
+            [$lockDatabase, $fairLock] = $this->buildFairRuntime($pdo);
+            parent::setPdo($pdo);
+            $this->lockDatabase = $lockDatabase;
+            $this->fairLock = $fairLock;
         } else {
+            parent::setPdo($pdo);
             $this->fairLock = null;
             $this->lockDatabase = null;
         }
@@ -810,7 +814,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * Installs one nested or pretend Laravel transaction level atomically.
      *
      * A manager or `beganTransaction` listener failure restores the preceding
-     * level through the normal rollback owner. Nested calls therefore remove the
+     * level through the normal rollback path. Nested calls therefore remove the
      * savepoint and its callbacks; pretend calls restore only temporary framework
      * state. Cleanup failures are secondary to the original setup failure.
      */
@@ -942,14 +946,25 @@ final class FairSQLiteConnection extends SQLiteConnection
         return $this->lockDatabase;
     }
 
-    private function installFairRuntime(PDO $pdo): void
+    /**
+     * Builds Fair SQLite state for a replacement PDO before Laravel exposes it.
+     *
+     * Waiter startup and object construction finish in local variables. A failure
+     * therefore leaves the connection's current PDO and coordination state unchanged.
+     *
+     * @param  PDO  $pdo  Concrete application PDO that will receive writer coordination.
+     * @return array{LockDatabase, FairSQLiteLock} Matching ticket database and application lock state.
+     *
+     * @throws Throwable When the selected waiter or Fair SQLite state cannot be created.
+     */
+    private function buildFairRuntime(PDO $pdo): array
     {
         $clock = $this->monotonic;
         $waiter = WaiterFactory::make($this->waitStrategy, $this->lockPath, $this->debug);
-        $this->lockDatabase = new LockDatabase($this->lockPath, $waiter, $clock, debug: $this->debug);
-        $this->fairLock = new FairSQLiteLock(
+        $lockDatabase = new LockDatabase($this->lockPath, $waiter, $clock, debug: $this->debug);
+        $fairLock = new FairSQLiteLock(
             $pdo,
-            $this->lockDatabase,
+            $lockDatabase,
             $waiter,
             $this->staleHeadSeconds,
             fn (Throwable $exception): null => $this->markUnknownPdoOutcome($exception),
@@ -961,6 +976,8 @@ final class FairSQLiteConnection extends SQLiteConnection
             $clock,
             $this->debug,
         );
+
+        return [$lockDatabase, $fairLock];
     }
 
     private function consumeNonTransactionalWriteCount(): int

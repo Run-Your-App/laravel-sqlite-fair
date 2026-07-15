@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Log;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
@@ -135,7 +136,7 @@ it('rejects an unknown schema version without changing it', function () {
     $pdo->exec('PRAGMA user_version=2');
     $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
-    expect(fn () => $database->open())->toThrow(RuntimeException::class)
+    expect(fn () => $database->open())->toThrow(FairSQLiteException::class)
         ->and((int) $pdo->query('PRAGMA user_version')->fetchColumn())->toBe(2);
 });
 
@@ -148,7 +149,7 @@ it('rejects an unexpected bootstrap table without replacing it', function () {
     $pdo->exec('CREATE TABLE unexpected (id INTEGER PRIMARY KEY)');
     $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
-    expect(fn () => $database->open())->toThrow(RuntimeException::class)
+    expect(fn () => $database->open())->toThrow(FairSQLiteException::class)
         ->and($pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='unexpected'")->fetchColumn())->toBe('unexpected');
 });
 
@@ -201,7 +202,7 @@ it('does not open a new handle for cleanup', function () {
         },
     );
 
-    expect(fn () => $database->cleanupExact(1))->toThrow(RuntimeException::class)
+    expect(fn () => $database->cleanupExact(1))->toThrow(FairSQLiteException::class)
         ->and($factoryCalls)->toBe(0);
 });
 
@@ -645,7 +646,7 @@ it('rejects invalid ticket columns without changing the schema', function () {
     $pdo->exec('PRAGMA user_version=1');
     $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
-    expect(fn () => $database->open())->toThrow(RuntimeException::class)
+    expect(fn () => $database->open())->toThrow(FairSQLiteException::class)
         ->and($pdo->query('PRAGMA table_info(tickets)')->fetchAll(PDO::FETCH_COLUMN, 1))->toBe(['wrong']);
 });
 
@@ -659,7 +660,7 @@ it('rejects a ticket primary key without autoincrement without changing it', fun
     $pdo->exec('PRAGMA user_version=1');
     $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0);
 
-    expect(fn () => $database->open())->toThrow(RuntimeException::class)
+    expect(fn () => $database->open())->toThrow(FairSQLiteException::class)
         ->and($pdo->query("SELECT sql FROM sqlite_master WHERE name='tickets'")->fetchColumn())
         ->toBe('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY)');
 });
@@ -1205,7 +1206,7 @@ it('rejects invalid final pragma readbacks without replacing the schema', functi
     };
     $database = new LockDatabase($directory, new PollingWaiter, static fn (): float => 0.0, $factory);
 
-    expect(fn () => $database->open())->toThrow(RuntimeException::class, 'PRAGMA validation')
+    expect(fn () => $database->open())->toThrow(FairSQLiteException::class, 'PRAGMA validation')
         ->and($seed->query("SELECT sql FROM sqlite_master WHERE name='tickets'")->fetchColumn())
         ->toBe('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY AUTOINCREMENT)');
 })->with([

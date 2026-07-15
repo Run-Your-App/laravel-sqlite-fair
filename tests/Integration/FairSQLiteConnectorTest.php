@@ -3,6 +3,9 @@
 declare(strict_types=1);
 
 use Illuminate\Database\SQLiteConnection;
+use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Worker;
+use Illuminate\Support\Facades\Event;
 use Orchestra\Testbench\TestCase;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteConnection;
@@ -54,6 +57,57 @@ test('provider publishes exactly the package configuration with its dedicated ta
         ->toBe([
             dirname(__DIR__, 2).'/config/sqlite-fair.php' => config_path('sqlite-fair.php'),
         ]);
+});
+
+test('provider retires a queue worker for an established poisoned fair connection', function (): void {
+    $this->app->register(FairSQLiteServiceProvider::class);
+    $connectionName = 'poisoned-'.str_replace('.', '-', uniqid('', true));
+    config()->set('database.default', 'unresolved-default');
+    config()->set('database.connections.unresolved-default', [
+        'driver' => 'sqlite',
+        'database' => ':memory:',
+    ]);
+    config()->set('database.connections.'.$connectionName, [
+        'driver' => 'fair-sqlite',
+        'database' => $this->databasePath,
+        'prefix' => '',
+        'lock_directory' => $this->lockDirectory,
+        'wait_strategy' => 'polling',
+        'stale_head_seconds' => 10.0,
+        'debug' => false,
+    ]);
+
+    $databaseManager = app('db');
+    $connection = $databaseManager->connection($connectionName);
+    $pdo = new class('sqlite:'.$this->databasePath, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]) extends PDO
+    {
+        public function commit(): bool
+        {
+            throw new PDOException('commit outcome unknown');
+        }
+    };
+    $connection->setPdo($pdo);
+
+    expect(fn () => $connection->transaction(static fn (): null => null))
+        ->toThrow(PDOException::class, 'commit outcome unknown');
+    expect($connection)->toBeInstanceOf(FairSQLiteConnection::class)
+        ->and($connection->hasUnknownPdoOutcome())->toBeTrue()
+        ->and(array_keys($databaseManager->getConnections()))->toBe([$connectionName]);
+
+    $worker = app('queue.worker');
+    expect($worker)->toBeInstanceOf(Worker::class);
+    $previousShouldQuit = $worker->shouldQuit;
+
+    try {
+        $worker->shouldQuit = false;
+
+        expect(Event::until(new Looping('database', 'default')))->toBeFalse()
+            ->and($worker->shouldQuit)->toBeTrue()
+            ->and(array_keys($databaseManager->getConnections()))->toBe([$connectionName]);
+    } finally {
+        $worker->shouldQuit = $previousShouldQuit;
+        $databaseManager->purge($connectionName);
+    }
 });
 
 test('platform path decisions cover posix wsl windows drives and unc without coercion', function (string $platform, string $path, bool $expected): void {

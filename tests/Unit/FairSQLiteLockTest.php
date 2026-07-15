@@ -24,6 +24,21 @@ it('acquires without a ticket and restores the active app busy timeout', functio
     $app->rollBack();
 })->with([1000, 10000, 4321]);
 
+it('rejects a nonpositive stale head threshold with the package exception', function (float $seconds) {
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/invalid-threshold.sqlite');
+    $waiter = new PollingWaiter;
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/invalid-threshold-lock', $waiter, static fn (): float => 0.0);
+
+    expect(fn () => new FairSQLiteLock(
+        $app,
+        $database,
+        $waiter,
+        $seconds,
+        static function (Throwable $exception): void {},
+        static function (): void {},
+    ))->toThrow(FairSQLiteException::class, 'stale-head seconds must be positive');
+})->with([0.0, -1.0]);
+
 it('starts waiter contention exactly once for every acquisition', function () {
     $state = (object) ['starts' => 0];
     $waiter = new class($state) implements Waiter
@@ -1086,8 +1101,12 @@ it('keeps recovery primary errors and cleans one own ticket after unknown fence 
 it('resets stale observation when fenced revalidation changes or vanishes', function (string $revalidation) {
     Log::spy();
     $loggedRecoveryHeads = [];
+    $loggedEvents = [];
     Log::shouldReceive('debug')->zeroOrMoreTimes()->andReturnUsing(
-        static function (string $message, array $context) use (&$loggedRecoveryHeads): void {
+        static function (string $message, array $context) use (&$loggedEvents, &$loggedRecoveryHeads): void {
+            if ($message === 'Fair SQLite transition.' && is_string($context['event'] ?? null)) {
+                $loggedEvents[] = $context['event'];
+            }
             if ($message === 'Fair SQLite transition.' && ($context['event'] ?? null) === 'stale_head_recovered') {
                 $loggedRecoveryHeads[] = $context['head_ticket'] ?? null;
             }
@@ -1144,7 +1163,8 @@ it('resets stale observation when fenced revalidation changes or vanishes', func
     expect($state->beginsAtBlock)->toBe($revalidation === 'changed' ? [0, 1] : [0])
         ->and($returned)->toBe($revalidation === 'changed' ? 3 : 3)
         ->and($state->begins)->toBe($revalidation === 'changed' ? 3 : 2);
-    expect($loggedRecoveryHeads)->not->toContain(1);
+    expect($loggedRecoveryHeads)->not->toContain(1)
+        ->and($loggedEvents)->not->toContain('lock_rollback');
     $app->rollBack();
     $database->deleteExact($returned);
 })->with(['changed', 'vanished']);

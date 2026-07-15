@@ -1165,6 +1165,42 @@ test('laravel manager reconnect rebuilds fair coordination around the fresh eage
     expect($connection->table('writes')->value('value'))->toBe('after-reconnect');
 });
 
+test('set pdo keeps the existing pdo when replacement coordination cannot be built', function (): void {
+    $capabilities = WaiterFactory::capabilities();
+    if ($capabilities['platform'] !== 'linux' || ! $capabilities['available']) {
+        $this->markTestSkipped('Failing native waiter startup requires Linux Inotify.');
+    }
+
+    $workspace = $this->workspace.'/failed-pdo-replacement';
+    mkdir($workspace, 0775, true);
+    $appPath = $workspace.'/app.sqlite';
+    touch($appPath);
+    $lockPath = $workspace.'/lock';
+    mkdir($lockPath, 0775, true);
+    $oldPdo = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $connection = new FairSQLiteConnection($oldPdo, $appPath, '', [
+        'driver' => 'fair-sqlite',
+        'name' => 'failed-pdo-replacement-'.str_replace('.', '-', uniqid('', true)),
+        'database' => $appPath,
+        'prefix' => '',
+        'lock_directory' => $lockPath,
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'native',
+    ], $appPath, $lockPath);
+    rmdir($lockPath);
+    $replacementPdo = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+
+    $failure = null;
+    try {
+        $connection->setPdo($replacementPdo);
+    } catch (Throwable $exception) {
+        $failure = $exception;
+    }
+
+    expect($connection->getRawPdo())->toBe($oldPdo)
+        ->and($failure)->toBeInstanceOf(FairSQLiteException::class);
+});
+
 test('a disconnected fair connection reconnects before the next write acquisition', function (): void {
     $workspace = $this->workspace.'/automatic-reconnect';
     mkdir($workspace, 0775, true);

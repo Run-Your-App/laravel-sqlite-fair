@@ -4,22 +4,25 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Laravel;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\DatabaseManager;
 use Illuminate\Database\SQLiteConnection;
+use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Worker;
 use Illuminate\Support\ServiceProvider;
 
 /**
- * Registers the Fair SQLite driver with a Laravel application.
+ * Registers Fair SQLite integration for Laravel applications.
  *
  * Laravel Composer discovery loads this provider. It merges the package defaults
  * and attaches the `fair-sqlite` connection factory to the application database
- * manager, including when another provider resolved that manager earlier in the
- * same application boot.
+ * manager. It also retires a queue worker before the worker accepts more work
+ * after any established Fair SQLite connection reports an unknown PDO outcome.
  */
 final class FairSQLiteServiceProvider extends ServiceProvider
 {
     /**
-     * Adds the package configuration and `fair-sqlite` connection factory to Laravel.
+     * Registers the package configuration and `fair-sqlite` connection factory.
      *
      * An already-resolved database manager is extended immediately. Otherwise the factory is attached when Laravel
      * first resolves that manager, so both boot orders create connections through `FairSQLiteConnector`.
@@ -47,17 +50,37 @@ final class FairSQLiteServiceProvider extends ServiceProvider
     }
 
     /**
-     * Makes the package configuration available to Laravel applications.
+     * Publishes configuration and retires poisoned Laravel queue workers.
      *
      * Applications may publish the documented package defaults to `config/sqlite-fair.php` with the
-     * `sqlite-fair-config` tag and then keep their deployment-specific lock directory and diagnostics setting there.
+     * `sqlite-fair-config` tag. Before each queued job, the listener inspects only connections that Laravel already
+     * established. It stops the current worker when one of those connections has an unknown PDO outcome, without
+     * resolving a configured connection or opening a database solely for this check.
      *
-     * @return void The publish mapping is registered directly with Laravel.
+     * @return void The publish mapping and queue-loop listener are registered directly with Laravel.
      */
     public function boot(): void
     {
         $this->publishes([
             dirname(__DIR__, 2).'/config/sqlite-fair.php' => $this->app->configPath('sqlite-fair.php'),
         ], 'sqlite-fair-config');
+
+        $this->app->make(Dispatcher::class)->listen(Looping::class, function (): ?bool {
+            $databaseManager = $this->app->make(DatabaseManager::class);
+
+            foreach ($databaseManager->getConnections() as $connection) {
+                if (! $connection instanceof FairSQLiteConnection || ! $connection->hasUnknownPdoOutcome()) {
+                    continue;
+                }
+
+                /** @var Worker $worker */
+                $worker = $this->app->make('queue.worker');
+                $worker->shouldQuit = true;
+
+                return false;
+            }
+
+            return null;
+        });
     }
 }

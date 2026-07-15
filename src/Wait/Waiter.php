@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
-use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 
 /**
  * Coordinates a bounded wake hint between complete lock-state checks.
@@ -29,7 +29,7 @@ interface Waiter
     public function beginContention(): void;
 
     /**
-     * Arms the adapter before the lock owner performs its second state check.
+     * Arms the adapter before `FairSQLiteLock` performs its second state check.
      *
      * Implementations must either prepare their next wake hint or leave an
      * already selected polling strategy ready. A native startup failure is an
@@ -38,19 +38,19 @@ interface Waiter
      *
      * @return void The adapter is ready for the caller's immediate second state check.
      *
-     * @throws RuntimeException When the adapter cannot arm its wait boundary.
+     * @throws FairSQLiteException When the adapter cannot arm its filesystem notification or polling state.
      */
     public function arm(): void;
 
     /**
      * Removes wake hints that arrived before the second state check.
      *
-     * The lock owner calls this immediately after arm() so buffered events cannot
+     * `FairSQLiteLock` calls this immediately after `arm()` so buffered events cannot
      * create a lost-wakeup window between native registration and state recheck.
      *
      * @return void Every wake hint already buffered by the adapter has been consumed.
      *
-     * @throws RuntimeException When buffered native events cannot be consumed.
+     * @throws FairSQLiteException When buffered native filesystem events cannot be consumed.
      */
     public function drain(): void;
 
@@ -65,7 +65,7 @@ interface Waiter
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
      * @return void The bounded wait ended; callers must perform a complete state check.
      *
-     * @throws RuntimeException When the selected wait operation cannot complete.
+     * @throws FairSQLiteException When the selected native or polling wait cannot complete.
      */
     public function block(?float $deadline, callable $monotonic): void;
 }

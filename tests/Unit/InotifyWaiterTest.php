@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Wait\InotifyWaiter;
 
 it('arms and consumes real single and coalesced inotify directory events on linux', function (int $events) {
@@ -43,7 +44,7 @@ it('degrades only auto after a post-arm inotify failure', function (bool $auto) 
         $waiter->block(0.0, static fn (): float => 0.0);
         expect(true)->toBeTrue();
     } else {
-        expect(fn () => $waiter->arm())->toThrow(RuntimeException::class);
+        expect(fn () => $waiter->arm())->toThrow(FairSQLiteException::class);
     }
 })->with([true, false]);
 

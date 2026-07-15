@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
-use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 
 /**
  * Uses Linux directory events as bounded wake hints for lock-state checks.
  *
- * WaiterFactory selects this adapter for Linux and WSL. It owns one Inotify
+ * `WaiterFactory` selects this adapter for Linux and WSL. It maintains one Inotify
  * stream and directory watch, while FairSQLiteLock remains responsible for every
  * queue and application-fence decision before and after a wakeup.
  *
@@ -33,23 +33,23 @@ final class InotifyWaiter implements Waiter
     private $select;
 
     /**
-     * Opens and arms the Linux directory-event boundary.
+     * Opens and arms Linux directory notifications.
      *
      * Auto mode may degrade only after this initial arm succeeds. The optional
-     * select callable is an internal deterministic seam for adapter failure tests.
+     * select callable lets tests reproduce adapter failures deterministically.
      *
      * @param  string  $directory  Existing absolute lock directory to observe.
      * @param  bool  $allowPostArmPolling  Whether a later native failure may switch this adapter to polling.
-     * @param  null|callable(array<int, resource>&, array<int, resource>&, array<int, resource>&, int, int): (int|false)  $select  Internal stream-select seam.
+     * @param  null|callable(array<int, resource>&, array<int, resource>&, array<int, resource>&, int, int): (int|false)  $select  Optional test replacement for `stream_select()`.
      * @param  bool  $debug  Whether post-arm degradation emits a structured debug log.
-     * @return void The adapter owns an armed Inotify stream and directory watch.
+     * @return void The adapter has an armed Inotify stream and directory watch.
      *
-     * @throws RuntimeException When Inotify is unavailable or the initial watch cannot be armed.
+     * @throws FairSQLiteException When Inotify is unavailable or the initial watch cannot be armed.
      */
     public function __construct(private readonly string $directory, private readonly bool $allowPostArmPolling = false, ?callable $select = null, private readonly bool $debug = false)
     {
         if (! function_exists('inotify_init')) {
-            throw new RuntimeException('The inotify extension is required for native Linux waiting.');
+            throw new FairSQLiteException('The inotify extension is required for native Linux waiting.');
         }
         $handle = inotify_init();
         stream_set_blocking($handle, false);
@@ -59,9 +59,9 @@ final class InotifyWaiter implements Waiter
     }
 
     /**
-     * Removes the directory watch and closes the owned Inotify stream.
+     * Removes the directory watch and closes the Inotify stream.
      *
-     * @return void The owned watch and stream have been released best-effort.
+     * @return void The watch and stream have been released best-effort.
      */
     public function __destruct()
     {
@@ -93,7 +93,7 @@ final class InotifyWaiter implements Waiter
      *
      * @return void The native watch is armed, or the permitted polling fallback is active.
      *
-     * @throws RuntimeException When the watch cannot be registered and degradation is not allowed.
+     * @throws FairSQLiteException When the watch cannot be registered and degradation is not allowed.
      */
     public function arm(): void
     {
@@ -111,7 +111,7 @@ final class InotifyWaiter implements Waiter
 
                 return;
             }
-            throw new RuntimeException('The lock directory inotify watch could not be armed.');
+            throw new FairSQLiteException('The lock directory inotify watch could not be armed.');
         }
         $this->watch = $watch;
         $this->armedOnce = true;
@@ -138,13 +138,13 @@ final class InotifyWaiter implements Waiter
      *
      * The wait lasts no longer than one tenth of a second or the supplied absolute
      * deadline. Auto mode switches permanently to polling after a post-arm select
-     * failure; native mode reports that failure to the lock owner.
+     * failure; native mode reports that failure to `FairSQLiteLock`.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
      * @return void The event, bounded interval, or supplied deadline ended the wait.
      *
-     * @throws RuntimeException When stream selection fails and degradation is not allowed.
+     * @throws FairSQLiteException When stream selection fails and degradation is not allowed.
      */
     public function block(?float $deadline, callable $monotonic): void
     {
@@ -163,7 +163,7 @@ final class InotifyWaiter implements Waiter
         $select = $this->select;
         if ($select($read, $write, $except, 0, (int) ($seconds * 1_000_000)) === false) {
             if (! $this->allowPostArmPolling) {
-                throw new RuntimeException('The inotify wait failed after the watch was armed.');
+                throw new FairSQLiteException('The inotify wait failed after the watch was armed.');
             }
             $this->degraded = true;
             FairSQLiteDebug::log($this->debug, 'waiter_degraded', ['adapter' => 'inotify', 'operation' => 'block', 'fallback' => 'polling']);

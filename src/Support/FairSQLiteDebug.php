@@ -10,9 +10,9 @@ use Throwable;
 /**
  * Emits the package's optional structured runtime diagnostics.
  *
- * Every runtime owner calls this single boundary for contention and abnormal
- * transitions. Diagnostics are deliberately best effort: a missing Laravel log
- * binding or a failing logger must never alter lock ownership, transaction state,
+ * Fair SQLite components call this method for contention and abnormal transitions.
+ * Diagnostics are deliberately best effort: a missing Laravel log binding or a
+ * failing logger must never alter ticket state, application fences, transaction state,
  * cleanup, or the exception observed by application code.
  *
  * @internal
@@ -36,7 +36,7 @@ final class FairSQLiteDebug
         try {
             Log::debug('Fair SQLite transition.', ['event' => $event, 'pid' => getmypid(), ...$context]);
         } catch (Throwable) {
-            // Optional diagnostics must never become part of the lock lifecycle.
+            // Optional diagnostics must never affect database coordination.
         }
     }
 }

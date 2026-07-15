@@ -7,22 +7,22 @@ namespace RunYourApp\LaravelSqliteFair\Lock;
 use PDO;
 use PDOException;
 use PDOStatement;
-use RuntimeException;
+use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
 use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
 use Throwable;
 
 /**
- * Owns the private SQLite ticket database for one application database.
+ * Manages the private SQLite ticket database for one application database.
  *
- * FairSQLiteLock uses this owner to admit, inspect, recover, and remove committed
+ * `FairSQLiteLock` uses this database to admit, inspect, recover, and remove committed
  * FIFO tickets. The PDO is opened lazily and invalidated after an indeterminate
  * handle outcome. Each retryable statement or mutation is bounded by the caller's
  * monotonic deadline and coordinated through the shared Waiter.
  *
  * Mutation units are intentionally separate so a commit with an unknown result is
- * never replayed. This owner creates and validates only `lock.sqlite`; it never
+ * never replayed. This class creates and validates only `lock.sqlite`; it never
  * identifies, opens, or mutates the application database.
  *
  * @internal
@@ -38,17 +38,17 @@ final class LockDatabase
     private $pdoFactory;
 
     /**
-     * Creates the lazy private ticket-database owner.
+     * Creates the lazy private ticket database.
      *
      * No directory, PDO, PRAGMA, or schema is touched until {@see open()}.
-     * The optional factory exists only for deterministic package verification.
+     * Tests may supply the optional PDO factory to verify setup failures deterministically.
      *
      * @param  string  $directory  Absolute directory dedicated to one application database.
      * @param  Waiter  $waiter  Wait adapter shared by every retryable lock-database unit.
      * @param  callable(): float  $monotonic  Monotonic seconds used for absolute deadlines.
-     * @param  (callable(string): PDO)|null  $pdoFactory  Internal PDO-construction seam receiving lock.sqlite's path.
+     * @param  (callable(string): PDO)|null  $pdoFactory  Optional test PDO factory receiving the `lock.sqlite` path.
      * @param  bool  $debug  Whether abnormal transitions emit structured Laravel debug logs.
-     * @return void The lazy owner is initialized without opening its PDO.
+     * @return void The ticket database is initialized without opening its PDO.
      *
      * @internal
      */
@@ -67,7 +67,7 @@ final class LockDatabase
     }
 
     /**
-     * Open and validate the private ticket database once per PDO handle.
+     * Opens and validates the private ticket database once per PDO handle.
      *
      * A new handle receives `busy_timeout=0`, persistent PRAGMAs, schema bootstrap,
      * and final validation exactly once. Later calls reuse it; invalidation causes
@@ -104,24 +104,27 @@ final class LockDatabase
      * Creates the shared ticket-database and native-waiter directory when missing.
      *
      * Path semantics belong to FairSQLiteConnector. This method performs only the
-     * idempotent filesystem creation needed by the connector and lazy direct owner.
+     * idempotent filesystem creation needed by the connector and lazy ticket database.
      *
      * @param  string  $directory  Caller-validated directory to create recursively.
      * @return void The supplied directory exists when the method returns.
      *
-     * @throws RuntimeException When the directory cannot be created.
+     * @throws FairSQLiteException When the directory cannot be created.
      *
      * @internal
      */
     public static function prepareDirectory(string $directory): void
     {
         if (! is_dir($directory) && ! @mkdir($directory, 0775, true) && ! is_dir($directory)) {
-            throw new RuntimeException("The SQLite fair lock directory [{$directory}] could not be created.");
+            throw new FairSQLiteException("The SQLite fair lock directory [{$directory}] could not be created.");
         }
     }
 
     /**
-     * Read the smallest committed queue ticket.
+     * Reads the smallest committed queue ticket.
+     *
+     * The query runs through the same bounded retry loop as other ticket-database
+     * reads and returns null only when no committed ticket exists.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
      * @return int|null The current queue head, or null when the queue is empty.
@@ -139,7 +142,7 @@ final class LockDatabase
                 return null;
             }
             if (! is_int($value) && ! is_string($value)) {
-                throw new RuntimeException('The SQLite fair head ticket is not numeric.');
+                throw new FairSQLiteException('The SQLite fair head ticket is not numeric.');
             }
 
             return (int) $value;
@@ -147,7 +150,10 @@ final class LockDatabase
     }
 
     /**
-     * Append one committed ticket to the FIFO queue.
+     * Appends one committed ticket to the FIFO queue.
+     *
+     * SQLite AUTOINCREMENT assigns the ticket. The method returns it only after
+     * the admission transaction has a known successful commit.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
      * @return int The AUTOINCREMENT ticket only after its transaction committed successfully.
@@ -171,7 +177,10 @@ final class LockDatabase
     }
 
     /**
-     * Delete one revalidated foreign queue head during fenced recovery.
+     * Deletes one revalidated foreign queue head during fenced recovery.
+     *
+     * `FairSQLiteLock` supplies the exact head seen again while holding the
+     * application writer fence; this method deletes no other ticket.
      *
      * @param  int  $observedForeignHead  Exact foreign head observed again under the application writer fence.
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
@@ -194,7 +203,10 @@ final class LockDatabase
     }
 
     /**
-     * Delete exactly one owned ticket after a known application outcome.
+     * Deletes exactly one owned ticket after a known application outcome.
+     *
+     * The exact ticket predicate makes repeated cleanup harmless when the row is
+     * already absent, while the surrounding mutation still requires a known commit.
      *
      * @param  int  $ownTicket  Ticket owned by the calling fair connection.
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for an unbounded wait.
@@ -217,7 +229,10 @@ final class LockDatabase
     }
 
     /**
-     * Perform one nonblocking emergency cleanup attempt.
+     * Performs one nonblocking emergency cleanup attempt.
+     *
+     * The method reuses the already-open ticket PDO, sets zero busy timeout, and
+     * never waits or replays the cleanup after contention.
      *
      * @param  int  $ownTicket  Ticket owned by the aborting connection.
      * @return void The single nonblocking cleanup attempt completed successfully.
@@ -227,7 +242,7 @@ final class LockDatabase
     public function cleanupExact(int $ownTicket): void
     {
         if ($this->pdo === null) {
-            throw new RuntimeException('A nonblocking cleanup requires the existing lock database handle.');
+            throw new FairSQLiteException('A nonblocking cleanup requires the existing lock database handle.');
         }
         $pdo = $this->requirePdo();
         $pdo->exec('PRAGMA busy_timeout=0');
@@ -261,12 +276,12 @@ final class LockDatabase
     }
 
     /**
-     * Classify only numeric SQLite BUSY or LOCKED PDO failures.
+     * Classifies only numeric SQLite BUSY or LOCKED PDO failures.
      *
      * @param  Throwable  $exception  Failure whose SQLite driver code should be inspected.
      * @return bool True for base or extended SQLite codes 5 and 6; false otherwise.
      *
-     * @internal Shared by lock-database and application-fence owners.
+     * @internal Shared by ticket-database retries and application-fence acquisition.
      */
     public static function isBusyOrLocked(Throwable $exception): bool
     {
@@ -297,7 +312,7 @@ final class LockDatabase
                 return false;
             }
             if ($currentVersion !== 0 || $currentTables !== []) {
-                throw new RuntimeException('The SQLite fair lock database changed to an unsupported schema during bootstrap.');
+                throw new FairSQLiteException('The SQLite fair lock database changed to an unsupported schema during bootstrap.');
             }
             $pdo->exec('CREATE TABLE tickets (ticket INTEGER PRIMARY KEY AUTOINCREMENT)');
             $pdo->exec('PRAGMA user_version=1');
@@ -316,11 +331,11 @@ final class LockDatabase
             || $this->tables($deadline) !== ['tickets']
             || $this->internalTables($deadline) !== ['sqlite_sequence']
             || $this->ticketColumns($deadline) !== [['ticket', 'INTEGER', 1]]) {
-            throw new RuntimeException('The SQLite fair lock database schema validation failed.');
+            throw new FairSQLiteException('The SQLite fair lock database schema validation failed.');
         }
         $sql = (string) $this->retryStatement(fn (): mixed => $this->queryValue("SELECT sql FROM sqlite_master WHERE type='table' AND name='tickets'"), $deadline);
         if (preg_match('/^CREATE TABLE tickets \(ticket INTEGER PRIMARY KEY AUTOINCREMENT\)$/i', $sql) !== 1) {
-            throw new RuntimeException('The SQLite fair ticket table does not own the required AUTOINCREMENT key.');
+            throw new FairSQLiteException('The SQLite fair ticket table does not own the required AUTOINCREMENT key.');
         }
         $this->assertPragmas($deadline);
     }
@@ -344,7 +359,7 @@ final class LockDatabase
             $columns = [];
             foreach ($rows as $row) {
                 if (! is_string($row['name'] ?? null) || ! is_string($row['type'] ?? null) || ! is_int($row['pk'] ?? null)) {
-                    throw new RuntimeException('The SQLite fair ticket column metadata is invalid.');
+                    throw new FairSQLiteException('The SQLite fair ticket column metadata is invalid.');
                 }
                 $columns[] = [$row['name'], mb_strtoupper($row['type']), $row['pk']];
             }
@@ -365,7 +380,7 @@ final class LockDatabase
         $journal = mb_strtolower((string) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA journal_mode'), $deadline));
         $synchronous = (int) $this->retryStatement(fn (): mixed => $this->queryValue('PRAGMA synchronous'), $deadline);
         if ($busy !== 0 || $journal !== 'delete' || $synchronous !== 1) {
-            throw new RuntimeException('The SQLite fair lock database PRAGMA validation failed.');
+            throw new FairSQLiteException('The SQLite fair lock database PRAGMA validation failed.');
         }
     }
 
@@ -374,7 +389,7 @@ final class LockDatabase
      *
      * Only numeric SQLite BUSY or LOCKED outcomes are retryable. The operation is
      * re-executed once immediately after arming and draining so a state change in
-     * the lost-wakeup window is observed before this owner blocks.
+     * the lost-wakeup window is observed before this database blocks.
      *
      * @template T
      *
@@ -530,7 +545,7 @@ final class LockDatabase
      *
      * @param  PDO  $pdo  Lock-database handle with the active mutation.
      * @param  Throwable  $primary  Deadline or waiter failure that must remain primary.
-     * @param  string  $operation  Stable diagnostic name for the rollback boundary.
+     * @param  string  $operation  Stable diagnostic name for the failed transaction step.
      * @return never This method always rethrows the primary failure after rollback handling.
      *
      * @throws Throwable Always rethrows the supplied primary failure.
@@ -586,14 +601,14 @@ final class LockDatabase
 
     private function requirePdo(): PDO
     {
-        return $this->pdo ?? throw new RuntimeException('The SQLite fair lock database handle is not open.');
+        return $this->pdo ?? throw new FairSQLiteException('The SQLite fair lock database handle is not open.');
     }
 
     private function query(string $sql): PDOStatement
     {
         $statement = $this->requirePdo()->query($sql);
         if ($statement === false) {
-            throw new RuntimeException('The SQLite fair lock query could not be prepared.');
+            throw new FairSQLiteException('The SQLite fair lock query could not be prepared.');
         }
 
         return $statement;
@@ -603,7 +618,7 @@ final class LockDatabase
     {
         $statement = $pdo->prepare($sql);
         if ($statement === false) {
-            throw new RuntimeException('The SQLite fair lock statement could not be prepared.');
+            throw new FairSQLiteException('The SQLite fair lock statement could not be prepared.');
         }
 
         return $statement;
@@ -627,7 +642,7 @@ final class LockDatabase
         $strings = [];
         foreach ($values as $value) {
             if (! is_string($value)) {
-                throw new RuntimeException('The SQLite fair schema name is not a string.');
+                throw new FairSQLiteException('The SQLite fair schema name is not a string.');
             }
             $strings[] = $value;
         }
@@ -639,7 +654,7 @@ final class LockDatabase
     {
         $value = $this->queryValue($sql);
         if (! is_int($value) && ! is_string($value)) {
-            throw new RuntimeException('The SQLite fair schema value is not numeric.');
+            throw new FairSQLiteException('The SQLite fair schema value is not numeric.');
         }
 
         return (int) $value;
@@ -650,12 +665,12 @@ final class LockDatabase
      *
      * Every internal caller selects an SQLite integer, text, or null scalar. PDO
      * returns false when the query has no row; no array, object, or floating result
-     * belongs to this lock-database query boundary.
+     * belongs to this ticket-database query.
      *
      * @param  string  $sql  Internal scalar query executed on the open lock PDO.
      * @return int|string|null|false The SQLite scalar, or false when no row exists.
      *
-     * @throws RuntimeException When the lock PDO is unavailable or the query cannot be prepared.
+     * @throws FairSQLiteException When the lock PDO is unavailable or the query cannot be prepared.
      */
     private function queryValue(string $sql): mixed
     {

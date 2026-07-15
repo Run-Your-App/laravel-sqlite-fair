@@ -1,7 +1,7 @@
 # Laravel SQLite Fair
 
 [![Tests](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/tests.yml/badge.svg)](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/tests.yml)
-[![Coverage ≥ 80%](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/coverage.yml)
+[![Coverage ≥ 90%](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/Run-Your-App/laravel-sqlite-fair/actions/workflows/coverage.yml)
 
 Laravel SQLite Fair is a drop-in SQLite driver for Laravel applications where web requests, queue workers, scheduled commands, and CLI processes all write to the same database. Change the connection driver from `sqlite` to `fair-sqlite`, then keep using Eloquent, the query builder, transactions, queues, and scheduled commands as usual. When writes collide, the package gives participating writers a committed FIFO turn instead of leaving them to race into sporadic `database is locked` or `SQLITE_BUSY` errors.
 

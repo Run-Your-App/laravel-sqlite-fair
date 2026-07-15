@@ -1,4 +1,4 @@
-name: Coverage ≥ 80%
+name: Coverage ≥ 90%
 
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
           --no-progress
 
       - name: Enforce line coverage
-        run: vendor/bin/pest --coverage --min=80 --only-summary-for-coverage-text
+        run: vendor/bin/pest --coverage --min=90 --only-summary-for-coverage-text
 
       - name: Analyse lowest supported Laravel
         run: composer analyse

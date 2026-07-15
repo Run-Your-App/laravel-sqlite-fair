@@ -9,7 +9,7 @@ return [
     |--------------------------------------------------------------------------
     |
     | Absolute directory that contains this database's private `lock.sqlite`
-    | ticket database. Native waiters observe this directory for wake hints.
+    | ticket database. Inotify observes this directory on Linux and WSL.
     |
     | Give every application database its own directory, and configure the same
     | directory in every cooperating web, queue, scheduler, and CLI process.
@@ -38,9 +38,10 @@ return [
     | Writer Wait Strategy
     |--------------------------------------------------------------------------
     |
-    | `auto` selects Inotify on Linux/WSL, FFI-kqueue on macOS, and polling on
-    | native Windows. `native` requires the host-native adapter and fails when
-    | that capability is unavailable. `polling` always uses bounded polling.
+    | `auto` selects Inotify on Linux/WSL and polling on every other host.
+    | `native` requires Linux with `ext-inotify` and fails everywhere else.
+    | `polling` works everywhere. It starts each writer acquisition at 100
+    | microseconds, doubles after each completed interval, and stops at 100 ms.
     |
     */
     'wait_strategy' => 'auto',

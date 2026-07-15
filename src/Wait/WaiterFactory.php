@@ -11,57 +11,47 @@ use RuntimeException;
  * Selects the wait adapter for the configured strategy and current host.
  *
  * FairSQLiteConnection uses this factory once per physical PDO lifecycle. The
- * factory owns platform policy, while each native adapter owns its capability
- * probe and operating-system boundary.
+ * factory owns platform policy, while InotifyWaiter owns the only native
+ * operating-system boundary and PollingWaiter serves every other host.
  *
  * @internal
  */
 final class WaiterFactory
 {
     /**
-     * Reports the native wait capability for one operating-system family.
+     * Reports the selected wait adapter for one operating-system family.
      *
-     * Runtime capability checks consume this read-only matrix. Optional booleans
-     * are deterministic test seams; production calls omit them so Linux checks
-     * Inotify and Darwin delegates its complete C-ABI probe to KqueueWaiter.
+     * Runtime capability checks consume this read-only matrix. The optional
+     * Inotify boolean is a deterministic test seam; production calls omit it so
+     * Linux checks the real extension while every non-Linux host reports polling.
      *
      * @param  string|null  $osFamily  PHP operating-system family, or null for the active host.
      * @param  bool|null  $inotify  Test override for Linux Inotify availability.
-     * @param  bool|null  $ffi  Test override for Darwin kqueue availability.
-     * @return array{platform: 'linux'|'darwin'|'windows'|'unsupported', native_available: bool} Normalized host policy and its native-adapter availability.
+     * @return array{platform: 'linux'|'other', waiter: 'inotify'|'polling', available: bool} Selected host policy and whether its required adapter is available.
      *
      * @internal Package tests and runtime capability checks use this deterministic matrix.
      */
-    public static function capabilities(?string $osFamily = null, ?bool $inotify = null, ?bool $ffi = null): array
+    public static function capabilities(?string $osFamily = null, ?bool $inotify = null): array
     {
         $family = mb_strtolower($osFamily ?? PHP_OS_FAMILY);
-        $platform = match ($family) {
-            'linux' => 'linux',
-            'darwin' => 'darwin',
-            'windows' => 'windows',
-            default => 'unsupported',
-        };
+        $platform = $family === 'linux' ? 'linux' : 'other';
 
         return [
             'platform' => $platform,
-            'native_available' => match ($platform) {
-                'linux' => $inotify ?? function_exists('inotify_init'),
-                'darwin' => $ffi ?? KqueueWaiter::isSupported(),
-                'windows' => false,
-                default => false,
-            },
+            'waiter' => $platform === 'linux' ? 'inotify' : 'polling',
+            'available' => $platform === 'linux' ? ($inotify ?? function_exists('inotify_init')) : true,
         ];
     }
 
     /**
      * Creates the concrete wait adapter for a prepared lock directory.
      *
-     * Explicit polling always succeeds through PollingWaiter. Auto uses the native
-     * Linux or Darwin adapter and allows only post-arm degradation; native keeps
-     * every adapter failure fatal. Windows auto intentionally selects polling.
+     * Explicit polling is available on every host. Auto requires Inotify on Linux
+     * and uses polling elsewhere. Native is a Linux-only request and keeps every
+     * Inotify startup or native-mode runtime failure fatal.
      *
      * @param  'auto'|'native'|'polling'|string  $strategy  Requested wait policy.
-     * @param  string  $directory  Existing absolute lock directory observed by native adapters.
+     * @param  string  $directory  Existing absolute lock directory observed by the Linux Inotify adapter.
      * @param  bool  $debug  Whether abnormal adapter transitions emit structured debug logs.
      * @return Waiter The selected and fully initialized wait adapter.
      *
@@ -78,21 +68,17 @@ final class WaiterFactory
         }
 
         $capabilities = self::capabilities();
-        if ($capabilities['platform'] === 'windows') {
+        if ($capabilities['platform'] === 'other') {
             if ($strategy === 'native') {
-                throw new RuntimeException('Native waiting is not supported on Windows; select polling or auto.');
+                throw new RuntimeException('Native waiting is supported only on Linux; select polling or auto.');
             }
 
             return new PollingWaiter();
         }
-        if (! $capabilities['native_available']) {
-            throw new RuntimeException("Native {$capabilities['platform']} waiting is unavailable.");
+        if (! $capabilities['available']) {
+            throw new RuntimeException('Native Linux waiting is unavailable because the inotify extension is missing.');
         }
 
-        return match ($capabilities['platform']) {
-            'linux' => new InotifyWaiter($directory, $strategy === 'auto', debug: $debug),
-            'darwin' => new KqueueWaiter($directory, $strategy === 'auto', debug: $debug),
-            default => throw new RuntimeException('The current operating system has no supported wait strategy.'),
-        };
+        return new InotifyWaiter($directory, $strategy === 'auto', debug: $debug);
     }
 }

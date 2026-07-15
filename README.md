@@ -5,9 +5,9 @@
 
 Laravel SQLite Fair is a drop-in SQLite driver for Laravel applications where web requests, queue workers, scheduled commands, and CLI processes all write to the same database. Change the connection driver from `sqlite` to `fair-sqlite`, then keep using Eloquent, the query builder, transactions, queues, and scheduled commands as usual. When writes collide, the package gives participating writers a committed FIFO turn instead of leaving them to race into sporadic `database is locked` or `SQLITE_BUSY` errors.
 
-The normal fast path stays lean: an uncontended writer acquires SQLite's writer slot directly and creates no coordination ticket. Only observed contention activates the dedicated `lock.sqlite` queue. Before business SQL begins, the driver verifies that the writer still owns its turn; abandoned waiting tickets are recoverable so one stopped process cannot block everyone else. No call-site PRAGMAs, retry wrappers, or lock helpers are required.
+An uncontended writer acquires SQLite's writer slot without creating a coordination ticket. The dedicated `lock.sqlite` queue starts only after another ticket or a busy writer slot reveals contention. Before business SQL begins, the driver verifies that the writer still owns its turn; abandoned waiting tickets are recoverable so one stopped process cannot block everyone else. No call-site PRAGMAs, retry wrappers, or lock helpers are required.
 
-The package preserves Laravel's transaction behavior while adding fair cross-process coordination and native wakeups for Linux and macOS. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
+The package preserves Laravel's transaction behavior while adding fair cross-process coordination. On Linux and WSL, `auto` and `native` use Inotify wakeups; `polling` remains available explicitly. Every other host uses bounded polling with `auto`. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
 
 ## Requirements
 
@@ -15,10 +15,9 @@ The package preserves Laravel's transaction behavior while adding fair cross-pro
 - Laravel 12.61.1 or later, below Laravel 13
 - PDO and PDO SQLite
 - SQLite 3
-- Linux, including WSL: `ext-inotify`
-- macOS: usable PHP FFI with kqueue
+- Linux, including WSL, with `auto` or `native`: `ext-inotify`
 
-Linux, including WSL, and macOS are first-class platforms. Missing `ext-inotify` on Linux/WSL or missing FFI/kqueue on macOS is a runtime requirement failure rather than a reason to skip verification. Only native Windows uses polling and is supported on a best-effort basis.
+Linux, including WSL, requires Inotify when `wait_strategy` is `auto` or `native`; a missing `ext-inotify` extension is a startup error. On every non-Linux host, `auto` selects polling. Explicit `polling` works on every host, while `native` is Linux-only.
 
 Every cooperating process for one file-backed application database must see the same database file and dedicated lock directory with correct SQLite locking, commit, and visibility semantics.
 
@@ -92,7 +91,9 @@ Laravel's case-sensitive memory forms—`:memory:` and database strings containi
 
 ## Waiting Strategies
 
-`auto` uses Inotify on Linux and WSL, FFI-kqueue on macOS, and polling on native Windows. `native` requires the platform's native adapter; `polling` always uses bounded polling. Missing native support on Linux/WSL or macOS is a startup error. PHP has no built-in kqueue file-watcher API, so the macOS adapter uses a small internal FFI binding without an external watcher process. Notifications reduce wake-up latency, while repeated state checks preserve progress if events are lost or coalesced.
+`auto` uses Inotify on Linux and WSL and polling on every other host. `native` requires Linux with `ext-inotify`; it fails on other hosts instead of silently changing strategy. `polling` is available everywhere.
+
+Polling starts each writer acquisition with a 100-microsecond delay, doubles the delay after each fully completed interval, and caps it at 100 milliseconds. Every wait is limited by the remaining acquisition deadline and returns to the lock owner for a fresh state check. The delay resets when the next writer acquisition begins.
 
 ## Normal Usage
 
@@ -202,7 +203,7 @@ composer analyse
 composer review
 ```
 
-Polling multi-process tests always provide the safety and progress proof. Linux runs, including WSL, must execute the real Inotify test; macOS runs must execute the real kqueue test; native Windows proves polling. The wrong OS skips only the adapter that cannot exist there, while a missing native capability on Linux/WSL or macOS fails verification.
+GitHub Actions runs on Linux with real Inotify support and exercises the explicit polling path in the same suite. Polling multi-process tests provide the safety and progress proof. Linux and WSL test runs must execute the real Inotify tests; missing native support on those hosts fails verification.
 
 The dependency gates cover Laravel 12.61.1 and the latest supported Laravel 12 release.
 

@@ -72,6 +72,19 @@ final class InotifyWaiter implements Waiter
     }
 
     /**
+     * Starts native waiting for a new writer acquisition.
+     *
+     * Inotify keeps no acquisition-local interval. If auto mode already degraded,
+     * the existing PollingWaiter resets its backoff for the new acquisition.
+     *
+     * @return void The native adapter or its existing polling fallback is ready.
+     */
+    public function beginContention(): void
+    {
+        $this->polling?->beginContention();
+    }
+
+    /**
      * Registers or refreshes the directory watch before the second state check.
      *
      * The watch covers create, delete, modify, move and completed-write events for

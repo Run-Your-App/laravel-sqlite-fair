@@ -9,14 +9,25 @@ use RuntimeException;
 /**
  * Coordinates a bounded wake hint between complete lock-state checks.
  *
- * FairSQLiteLock calls this protocol after checking the ticket queue and the
- * application writer fence. Implementations may consume native directory events
- * or a polling interval, but an event never replaces the second state check.
+ * FairSQLiteLock starts this protocol once per writer acquisition. Whenever lock
+ * state requires waiting, it arms the adapter, drains buffered hints, checks the
+ * complete state again and then blocks. A wake event never replaces that recheck.
  *
  * @internal
  */
 interface Waiter
 {
+    /**
+     * Starts a new writer-acquisition wait cycle.
+     *
+     * FairSQLiteLock calls this exactly once before each direct or queued
+     * acquisition. Implementations reset only per-acquisition wait state here;
+     * they must not inspect or change the ticket queue or application database.
+     *
+     * @return void The adapter is ready to begin a new acquisition cycle.
+     */
+    public function beginContention(): void;
+
     /**
      * Arms the adapter before the lock owner performs its second state check.
      *

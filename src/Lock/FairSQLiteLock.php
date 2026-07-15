@@ -124,6 +124,7 @@ final class FairSQLiteLock
      */
     private function acquireWithMode(bool $forceQueued, ?float $deadline): ?int
     {
+        $this->waiter->beginContention();
         $clock = $this->monotonic;
         $ticket = null;
         $fenceHeld = false;

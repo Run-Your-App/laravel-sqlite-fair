@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   tests:
-    name: Laravel latest
+    name: Linux native and polling
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

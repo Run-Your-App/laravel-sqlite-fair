@@ -123,9 +123,10 @@ beforeEach(function (): void {
 
 test('native connection startup prepares its missing lock directory before arming the waiter', function (): void {
     $capabilities = WaiterFactory::capabilities();
-    if (! in_array($capabilities['platform'], ['linux', 'darwin'], true) || ! $capabilities['native_available']) {
-        $this->markTestSkipped('Native startup directory ordering belongs to supported Linux and Darwin hosts.');
+    if ($capabilities['platform'] !== 'linux') {
+        $this->markTestSkipped('Native startup directory ordering belongs to Linux hosts.');
     }
+    expect($capabilities['available'])->toBeTrue();
 
     $workspace = $this->workspace.'/native-startup';
     mkdir($workspace, 0775, true);

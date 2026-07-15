@@ -158,6 +158,8 @@ it('performs cleanup as one nonblocking attempt without waiter replay', function
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             $this->state->calls++;
@@ -439,6 +441,8 @@ it('rolls back an active busy commit when the waiter fails without replaying the
     {
         public function __construct(private readonly string $failurePoint) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             if ($this->failurePoint === 'arm') {
@@ -583,6 +587,8 @@ it('retries a numeric busy or locked head read only after arm and drain', functi
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             $this->state->events[] = 'arm';
@@ -721,6 +727,8 @@ it('retries numeric setup contention after arming and draining', function (int $
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             $this->state->events[] = 'arm';
@@ -766,6 +774,8 @@ it('rolls back and retries a busy statement inside each mutation unit', function
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void
         {
@@ -887,6 +897,8 @@ it('retries numeric contention before begin for every mutation unit', function (
     $state = (object) ['unit' => $unit === 'bootstrap' ? 'bootstrap' : null, 'begins' => 0];
     $waiter = new class implements Waiter
     {
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}
@@ -933,6 +945,8 @@ it('blocks only after the immediate second begin statecheck is still busy', func
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             $this->state->events[] = 'arm';
@@ -978,6 +992,8 @@ it('makes exactly one cleanup statement attempt for busy and permanent failures'
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void
         {
@@ -1030,6 +1046,8 @@ it('handles busy deadline and permanent failures during final validation', funct
     $clock = static fn (): float => $mode === 'deadline' && $state->throws > 0 ? 2.0 : 0.0;
     $waiter = new class implements Waiter
     {
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}
@@ -1087,6 +1105,8 @@ it('retries only the active idempotent setup statement for numeric contention', 
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void
         {
@@ -1312,6 +1332,8 @@ it('handles bootstrap statement rollback and commit outcomes without unsafe repl
     $state = (object) ['mode' => $mode, 'creates' => 0, 'rollbacks' => 0, 'factory' => 0];
     $waiter = new class implements Waiter
     {
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}

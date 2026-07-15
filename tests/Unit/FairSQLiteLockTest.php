@@ -24,6 +24,39 @@ it('acquires without a ticket and restores the active app busy timeout', functio
     $app->rollBack();
 })->with([1000, 10000, 4321]);
 
+it('starts waiter contention exactly once for every acquisition', function () {
+    $state = (object) ['starts' => 0];
+    $waiter = new class($state) implements Waiter
+    {
+        public function __construct(private object $state) {}
+
+        public function beginContention(): void
+        {
+            $this->state->starts++;
+        }
+
+        public function arm(): void {}
+
+        public function drain(): void {}
+
+        public function block(?float $deadline, callable $monotonic): void {}
+    };
+    $clock = static fn (): float => 0.0;
+    $app = new PDO('sqlite:'.$GLOBALS['sqliteFairTestRunDirectory'].'/contention-start.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $database = new LockDatabase($GLOBALS['sqliteFairTestRunDirectory'].'/contention-start-lock', $waiter, $clock);
+    $lock = new FairSQLiteLock($app, $database, $waiter, 10.0, static function (Throwable $e): void {}, static function (): void {}, $clock);
+
+    expect($lock->acquire())->toBeNull()
+        ->and($state->starts)->toBe(1);
+    $app->rollBack();
+
+    $ticket = $lock->acquireQueued();
+    expect($ticket)->toBe(1)
+        ->and($state->starts)->toBe(2);
+    $app->rollBack();
+    $database->deleteExact($ticket);
+});
+
 it('admits before the first app fence when queued acquisition is forced', function () {
     $state = (object) ['database' => null, 'headsAtBegin' => []];
     $clock = static fn (): float => 0.0;
@@ -151,6 +184,8 @@ it('throws the typed lock-owner timeout after a bounded queued wait', function (
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -320,6 +355,8 @@ it('arms drains and rechecks the queued condition before blocking', function () 
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void
         {
             $this->state->events[] = 'arm';
@@ -377,6 +414,8 @@ it('transitions from one busy direct begin to exactly one admission before queue
     $waiter = new class($blocker, $state) implements Waiter
     {
         public function __construct(private PDO $blocker, private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -493,6 +532,8 @@ it('keeps a foreign non-head off the app fence below stale threshold then recove
     {
         public function __construct(private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}
@@ -543,6 +584,8 @@ it('restores busy timeout after direct busy and cleans admission on permanent qu
     {
         public function __construct(private PDO $blocker, private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}
@@ -574,6 +617,8 @@ it('never attempts an app fence while behind two or three committed foreign tick
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -627,6 +672,8 @@ it('rolls back and requeues with a higher ticket when under-fence ownership is m
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -682,6 +729,8 @@ it('switches to queued ownership when a ticket appears between the two direct re
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -772,6 +821,8 @@ it('does not replay unknown queued revalidation rollback and cleans its own tick
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -902,6 +953,8 @@ it('propagates one absolute deadline unchanged through lock database and fair wa
     {
         public function __construct(private PDO $blocker, private object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}
@@ -961,6 +1014,8 @@ it('keeps recovery primary errors and cleans one own ticket after unknown fence 
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 
@@ -1043,6 +1098,8 @@ it('resets stale observation when fenced revalidation changes or vanishes', func
     $waiter = new class($state) implements Waiter
     {
         public function __construct(private object $state) {}
+
+        public function beginContention(): void {}
 
         public function arm(): void {}
 

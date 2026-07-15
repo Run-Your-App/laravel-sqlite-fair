@@ -11,22 +11,9 @@ permissions:
 
 jobs:
   coverage:
-    name: ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
+    name: Linux native and polling
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: Linux
-            os: ubuntu-latest
-            extensions: pdo_sqlite, inotify
-            ini-values: pcov.directory=src
-          - platform: macOS
-            os: macos-latest
-            extensions: pdo_sqlite, ffi
-            ini-values: pcov.directory=src, ffi.enable=true
 
     steps:
       - name: Checkout
@@ -36,8 +23,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: ${{ matrix.extensions }}
-          ini-values: ${{ matrix.ini-values }}
+          extensions: pdo_sqlite, inotify
+          ini-values: pcov.directory=src
           coverage: pcov
           tools: composer:v2
         env:
@@ -56,5 +43,4 @@ jobs:
         run: vendor/bin/pest --coverage --min=80 --only-summary-for-coverage-text
 
       - name: Analyse lowest supported Laravel
-        if: matrix.platform == 'Linux'
         run: composer analyse

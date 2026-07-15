@@ -7,67 +7,59 @@ namespace RunYourApp\LaravelSqliteFair\Wait;
 use RuntimeException;
 
 /**
- * Provides bounded polling through an owned selectable socket pair.
+ * Provides bounded polling between complete lock-state checks.
  *
- * WaiterFactory selects this adapter explicitly and for native Windows. Native
- * adapters also use it after an allowed post-arm degradation. The sockets provide
- * an interruptible interval without adding process sleeps or filesystem signals.
+ * WaiterFactory selects this adapter explicitly and on every non-Linux host.
+ * InotifyWaiter also uses it after an allowed post-arm degradation. Each writer
+ * acquisition starts at 100 microseconds and backs off to at most 100 milliseconds.
  *
  * @internal
  */
 final class PollingWaiter implements Waiter
 {
-    /** @var array{0: resource, 1: resource} */
-    private array $sockets;
+    private const int INITIAL_MICROSECONDS = 100;
+
+    private const int MAXIMUM_MICROSECONDS = 100_000;
+
+    private int $intervalMicroseconds = self::INITIAL_MICROSECONDS;
+
+    /** @var callable(int, int): (array{seconds: int, nanoseconds: int}|bool) */
+    private $sleep;
 
     /**
-     * Creates the connected local sockets used for every polling interval.
+     * Creates the polling adapter and its sleep boundary.
      *
-     * @return void The adapter owns a connected socket pair for bounded polling.
+     * Production uses time_nanosleep(). Package tests may inject the same callable
+     * shape to observe requested intervals without waiting on wall-clock time.
      *
-     * @throws RuntimeException When the loopback server, address, client, or accepted socket cannot be created.
+     * @param  null|callable(int, int): (array{seconds: int, nanoseconds: int}|bool)  $sleep  Internal deterministic sleep seam.
+     * @return void The adapter is ready at the initial polling interval.
      */
-    public function __construct()
+    public function __construct(?callable $sleep = null)
     {
-        $server = @stream_socket_server('tcp://127.0.0.1:0', $errorCode, $errorMessage);
-        if ($server === false) {
-            throw new RuntimeException("The polling wait server could not be created: {$errorMessage} ({$errorCode}).");
-        }
-        $address = stream_socket_get_name($server, false);
-        if ($address === false) {
-            fclose($server);
-            throw new RuntimeException('The polling wait server address could not be read.');
-        }
-        $writeSocket = @stream_socket_client('tcp://'.$address, $errorCode, $errorMessage);
-        $readSocket = @stream_socket_accept($server, 1);
-        fclose($server);
-        if ($writeSocket === false || $readSocket === false) {
-            if (is_resource($writeSocket)) {
-                fclose($writeSocket);
-            }
-            throw new RuntimeException("The polling wait connection could not be created: {$errorMessage} ({$errorCode}).");
-        }
-        $this->sockets = [$readSocket, $writeSocket];
+        $this->sleep = $sleep ?? static fn (int $seconds, int $nanoseconds): array|bool => time_nanosleep($seconds, $nanoseconds);
     }
 
     /**
-     * Closes both sockets owned by this polling adapter.
+     * Starts polling for a new writer acquisition.
      *
-     * @return void Both sockets owned by the adapter have been closed.
+     * FairSQLiteLock calls this once per acquisition so a prior contended writer
+     * cannot leave the next writer at a long polling interval.
+     *
+     * @return void The next complete wait starts at 100 microseconds.
      */
-    public function __destruct()
+    public function beginContention(): void
     {
-        fclose($this->sockets[0]);
-        fclose($this->sockets[1]);
+        $this->intervalMicroseconds = self::INITIAL_MICROSECONDS;
     }
 
     /**
-     * Leaves the always-ready polling interval prepared for the second state check.
+     * Leaves the polling interval prepared for the second state check.
      *
      * Polling has no external event source to register, so this method intentionally
-     * keeps the existing socket pair unchanged.
+     * keeps the current backoff interval unchanged.
      *
-     * @return void The existing polling boundary remains ready for the state check.
+     * @return void The current polling interval remains ready for the state check.
      */
     public function arm(): void {}
 
@@ -79,28 +71,38 @@ final class PollingWaiter implements Waiter
     public function drain(): void {}
 
     /**
-     * Waits for the bounded polling interval on the owned read socket.
+     * Sleeps for the current bounded polling interval.
      *
-     * The socket is intentionally never written during normal operation, so select
-     * returns after at most one tenth of a second or the earlier absolute deadline.
+     * A complete interval doubles the next wait up to 100 milliseconds. Deadline-
+     * shortened sleeps, expired deadlines, signal interruptions and failures leave
+     * the interval unchanged so only real completed backoff steps advance it.
      *
      * @param  float|null  $deadline  Absolute monotonic deadline, or null for the standard bounded interval.
      * @param  callable(): float  $monotonic  Returns the current monotonic time in seconds.
-     * @return void The bounded interval or supplied deadline ended the wait.
+     * @return void The interval ended or the caller must immediately recheck lock state.
      *
-     * @throws RuntimeException When stream selection cannot complete.
+     * @throws RuntimeException When time_nanosleep() reports a terminal failure.
      */
     public function block(?float $deadline, callable $monotonic): void
     {
-        $seconds = $deadline === null ? 0.1 : max(0.0, min(0.1, $deadline - $monotonic()));
-        if ($seconds === 0.0) {
-            return;
+        $sleepMicroseconds = $this->intervalMicroseconds;
+        if ($deadline !== null) {
+            $remainingMicroseconds = (int) floor(($deadline - $monotonic()) * 1_000_000);
+            if ($remainingMicroseconds < 1) {
+                return;
+            }
+            $sleepMicroseconds = min($sleepMicroseconds, $remainingMicroseconds);
         }
-        $read = [$this->sockets[0]];
-        $write = [];
-        $except = [];
-        if (@stream_select($read, $write, $except, 0, (int) ($seconds * 1_000_000)) === false) {
+
+        $sleep = $this->sleep;
+        $result = $sleep(0, $sleepMicroseconds * 1_000);
+        if ($result === false) {
             throw new RuntimeException('The polling wait interval could not be completed.');
         }
+        if (is_array($result) || $sleepMicroseconds !== $this->intervalMicroseconds) {
+            return;
+        }
+
+        $this->intervalMicroseconds = min($this->intervalMicroseconds * 2, self::MAXIMUM_MICROSECONDS);
     }
 }

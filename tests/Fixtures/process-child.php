@@ -68,6 +68,8 @@ function deleteTicketAfterReaderReleases(string $workspace): void
     {
         public function __construct(private readonly string $workspace, private readonly object $state) {}
 
+        public function beginContention(): void {}
+
         public function arm(): void {}
 
         public function drain(): void {}

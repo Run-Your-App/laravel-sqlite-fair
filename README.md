@@ -7,7 +7,7 @@ Laravel SQLite Fair is a drop-in SQLite driver for Laravel applications where we
 
 An uncontended writer acquires SQLite's writer slot without creating a coordination ticket. The dedicated `lock.sqlite` queue starts only after another ticket or a busy writer slot reveals contention. Before business SQL begins, the driver verifies that the writer still owns its turn; abandoned waiting tickets are recoverable so one stopped process cannot block everyone else. No call-site PRAGMAs, retry wrappers, or lock helpers are required.
 
-The package preserves Laravel's transaction behavior while adding fair cross-process coordination. On Linux and WSL, `auto` and `native` use Inotify wakeups; `polling` remains available explicitly. Every other host uses bounded polling with `auto`. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
+The package preserves Laravel's transaction behavior while adding fair cross-process coordination. On Linux, `auto` and `native` use Inotify wakeups; `polling` remains available explicitly. Every other host uses bounded polling with `auto`. A process paused longer than `stale_head_seconds` may lose its turn and is therefore outside the starvation-free guarantee.
 
 ## Requirements
 
@@ -15,43 +15,28 @@ The package preserves Laravel's transaction behavior while adding fair cross-pro
 - Laravel 12.61.1 or later, below Laravel 13
 - PDO and PDO SQLite
 - SQLite 3
-- Linux, including WSL, with `auto` or `native`: `ext-inotify`
+- Linux with `auto` or `native`: `ext-inotify`
 
-Linux, including WSL, requires Inotify when `wait_strategy` is `auto` or `native`; a missing `ext-inotify` extension is a startup error. On every non-Linux host, `auto` selects polling. Explicit `polling` works on every host, while `native` is Linux-only.
+Linux requires Inotify when `wait_strategy` is `auto` or `native`; a missing `ext-inotify` extension is a startup error. On every non-Linux host, `auto` selects polling. Explicit `polling` works on every host, while `native` is Linux-only.
 
 Every cooperating process for one file-backed application database must see the same database file and dedicated lock directory with correct SQLite locking, commit, and visibility semantics.
 
 ## Installation
 
-The package is maintained in its own Git repository. Applications that keep a local checkout at `packages/laravel-sqlite-fair` can register it as a Composer path repository:
-
-```json
-{
-    "repositories": [
-        {
-            "type": "path",
-            "url": "packages/laravel-sqlite-fair",
-            "options": {
-                "symlink": false
-            }
-        }
-    ]
-}
-```
-
-Then install the development package version from the application root:
+Register the GitHub repository with Composer and install the package:
 
 ```bash
+composer config repositories.laravel-sqlite-fair vcs https://github.com/Run-Your-App/laravel-sqlite-fair
 composer require run-your-app/laravel-sqlite-fair:dev-main
 ```
 
-Laravel then discovers the package service provider automatically. Publish the package configuration when the application needs deployment-specific values:
+Laravel discovers the package service provider automatically. Publish the package configuration to change its defaults:
 
 ```bash
 php artisan vendor:publish --provider="RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteServiceProvider" --tag=sqlite-fair-config
 ```
 
-The published `config/sqlite-fair.php` becomes the application's single owner for package defaults. Connection-local values remain available only when one named database connection intentionally needs to override those application defaults.
+The published `config/sqlite-fair.php` applies to every Fair SQLite connection. Values set directly on a connection override those defaults.
 
 ## Configuration
 
@@ -67,12 +52,6 @@ Use the `fair-sqlite` driver for a file-backed SQLite connection:
     'stale_head_seconds' => 10.0,
     'wait_strategy' => 'auto',
     'debug' => false,
-
-    'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
-    'busy_timeout' => env(
-        'DB_SQLITE_BUSY_TIMEOUT',
-        env('APP_ENV') === 'production' ? 10_000 : 1_000,
-    ),
 ];
 ```
 
@@ -85,13 +64,13 @@ Use the `fair-sqlite` driver for a file-backed SQLite connection:
 
 Connection-local values override package defaults. `lock_directory` must be an absolute path; use a different directory for every application database and the same directory for all cooperating processes. Existing database and lock paths are resolved with `realpath()`, so symlink, `.` and `..` aliases identify the same files. Numeric and boolean options are strictly typed and are never coerced from strings.
 
-The application remains responsible for database-tuning PRAGMAs such as `journal_mode`, `synchronous`, `foreign_keys`, cache sizing, ICU functions, and `busy_timeout`. Fair SQLite temporarily makes its writer-fence attempt nonblocking and restores the connection's previous `busy_timeout`; it does not replace the application's tuning.
+The application remains responsible for SQLite settings such as `journal_mode`, `synchronous`, `foreign_keys`, `cache_size`, and `busy_timeout`. Fair SQLite temporarily makes its writer-fence attempt nonblocking and restores the connection's previous `busy_timeout`; it does not replace the application's tuning.
 
 Laravel's case-sensitive memory forms—`:memory:` and database strings containing `?mode=memory` or `&mode=memory`—use upstream `SQLiteConnection`. Other database strings are file-backed. Memory connections do not create tickets, open `lock.sqlite`, or expose `FairSQLiteConnection` APIs, even though the configured driver key remains `fair-sqlite`.
 
 ## Waiting Strategies
 
-`auto` uses Inotify on Linux and WSL and polling on every other host. `native` requires Linux with `ext-inotify`; it fails on other hosts instead of silently changing strategy. `polling` is available everywhere.
+`auto` uses Inotify on Linux and polling on every other host. `native` requires Linux with `ext-inotify`; it fails on other hosts instead of silently changing strategy. `polling` is available everywhere.
 
 Polling starts each writer acquisition with a 100-microsecond delay, doubles the delay after each fully completed interval, and caps it at 100 milliseconds. Every wait is limited by the remaining acquisition deadline and returns to the lock owner for a fresh state check. The delay resets when the next writer acquisition begins.
 
@@ -167,15 +146,10 @@ The callback receives the active connection and must execute exactly one `statem
 ## Failure and Crash Semantics
 
 - Uncontended writers create no tickets. Once contention is observed, committed tickets are served FIFO.
-- `configurePersistentPragmas()` runs once per newly opened lock-database PDO, not per ticket. It runs again only after that handle is invalidated and reopened.
 - A lock-database commit with an unknown result is never replayed; the unusable handle is discarded.
 - Failures before business SQL roll back an active writer fence and make one bounded attempt to remove only the writer's own ticket. Cleanup failures never replace the original exception.
 - A crash before application commit lets SQLite roll back the transaction. A crash after business commit but before ticket deletion leaves a recoverable stale ticket; recovery never repeats the business callback.
 - An unknown application-PDO outcome disconnects that PDO and blocks the same database identity for the rest of the current process. Before the next queued job, the package stops the current Laravel queue worker when any already-established Fair SQLite connection has entered that state.
-
-## Destructive Restore and Wipe Boundary
-
-Online restore and full storage wipe are outside the package's safety guarantee. For an operator-controlled replacement, stop every writer, replace or remove the application database and its dedicated lock directory together, then restart the processes. Replacing only the application database can leave old tickets behind and does not stop an already-running writer from accessing the replacement.
 
 ## Debug Logging
 
@@ -203,7 +177,7 @@ composer analyse
 composer review
 ```
 
-GitHub Actions runs on Linux with real Inotify support and exercises the explicit polling path in the same suite. Polling multi-process tests provide the safety and progress proof. Linux and WSL test runs must execute the real Inotify tests; missing native support on those hosts fails verification.
+GitHub Actions runs on Linux with real Inotify support and exercises the explicit polling path in the same suite. Polling multi-process tests provide the safety and progress proof. Linux test runs must execute the real Inotify tests; missing native support on those hosts fails verification.
 
 The dependency gates cover Laravel 12.61.1 and the latest supported Laravel 12 release.
 

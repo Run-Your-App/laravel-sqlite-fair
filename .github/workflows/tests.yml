@@ -26,7 +26,7 @@ jobs:
             extensions: pdo_sqlite
           - os: windows-latest
             name: Windows polling
-            extensions: pdo_sqlite
+            extensions: pdo_sqlite, fileinfo
 
     steps:
       - name: Checkout

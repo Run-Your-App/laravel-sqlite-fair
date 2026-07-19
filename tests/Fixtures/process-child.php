@@ -707,14 +707,14 @@ function runCleanupFailure(string $workspace): void
     echo 'original-priority-and-one-cleanup-report';
 }
 
-/** Waits on a real listener and reports the persisted signal notification. */
+/** Waits on the persisted coordination signal. */
 function runSignalWaiter(string $workspace): void
 {
     waitForSignal($workspace, 'roundtrip');
     echo 'notified';
 }
 
-/** Waits until the listener is registered, then persists and delivers its signal. */
+/** Waits until the persisted waiter registration exists, then persists its signal. */
 function runSignalSender(string $workspace): void
 {
     waitForSignal($workspace, '__waiter__:roundtrip', 2.0);
@@ -722,42 +722,23 @@ function runSignalSender(string $workspace): void
     echo 'sent';
 }
 
-/** Records a deterministic cross-process signal and wakes its registered listener. */
+/** Records a deterministic cross-process signal. */
 function signal(string $workspace, string $name, string $value = '1'): void
 {
     $pdo = coordinationDatabase($workspace);
     $statement = $pdo->prepare('INSERT OR REPLACE INTO signals (name, value) VALUES (:name, :value)');
     $statement->execute(['name' => $name, 'value' => $value]);
     $statement->closeCursor();
-
-    $address = signalValue($workspace, '__waiter__:'.$name);
-    if ($address === null) {
-        return;
-    }
-
-    $errorCode = 0;
-    $errorMessage = '';
-    $connection = @stream_socket_client(
-        'tcp://'.$address,
-        $errorCode,
-        $errorMessage,
-        1.0,
-        STREAM_CLIENT_CONNECT,
-    );
-    if ($connection === false) {
-        return;
-    }
-    fwrite($connection, '1');
-    fclose($connection);
 }
 
 /** Reads one deterministic cross-process signal value. */
-function signalValue(string $workspace, string $name): ?string
+function signalValue(string $workspace, string $name, ?PDO $pdo = null): ?string
 {
-    $pdo = coordinationDatabase($workspace);
+    $pdo ??= coordinationDatabase($workspace);
     $statement = $pdo->prepare('SELECT value FROM signals WHERE name = :name');
     $statement->execute(['name' => $name]);
     $value = $statement->fetchColumn();
+    $statement->closeCursor();
 
     return is_string($value) ? $value : null;
 }
@@ -785,52 +766,33 @@ function recordEvent(string $workspace, string $event): void
     $statement->execute(['event' => $event]);
 }
 
-/** Waits boundedly on a real TCP listener for one persisted SQLite signal. */
+/** Waits boundedly for one persisted SQLite signal. */
 function waitForSignal(string $workspace, string $name, float $timeoutSeconds = 10.0): void
 {
     if (! is_finite($timeoutSeconds) || $timeoutSeconds <= 0.0) {
         throw new RuntimeException('The process coordination timeout must be finite and positive.');
     }
-    if (signalValue($workspace, $name) !== null) {
+    $pdo = coordinationDatabase($workspace);
+    if (signalValue($workspace, $name, $pdo) !== null) {
         return;
     }
 
-    $errorCode = 0;
-    $errorMessage = '';
-    $listener = @stream_socket_server(
-        'tcp://127.0.0.1:0',
-        $errorCode,
-        $errorMessage,
-        STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
-    );
-    if ($listener === false) {
-        throw new RuntimeException("The SQLite fair process barrier [{$name}] could not open its listener.");
-    }
-    $address = stream_socket_get_name($listener, false);
-    if (! is_string($address) || $address === '') {
-        fclose($listener);
-        throw new RuntimeException("The SQLite fair process barrier [{$name}] has no listener address.");
-    }
     $registration = '__waiter__:'.$name;
     $deadline = hrtime(true) / 1e9 + $timeoutSeconds;
-    signal($workspace, $registration, $address);
+    signal($workspace, $registration);
     try {
-        if (signalValue($workspace, $name) !== null) {
-            return;
-        }
-        $remaining = max(0.0, $deadline - hrtime(true) / 1e9);
-        $notification = @stream_socket_accept($listener, $remaining);
-        if ($notification !== false) {
-            fclose($notification);
-        }
-        if (signalValue($workspace, $name) === null) {
-            throw new RuntimeException("The SQLite fair process barrier [{$name}] was not reached.");
+        while (signalValue($workspace, $name, $pdo) === null) {
+            if (hrtime(true) / 1e9 >= $deadline) {
+                throw new RuntimeException("The SQLite fair process barrier [{$name}] was not reached.");
+            }
+            if (time_nanosleep(0, 1_000_000) === false) {
+                throw new RuntimeException("The SQLite fair process barrier [{$name}] could not wait.");
+            }
         }
     } finally {
-        $pdo = coordinationDatabase($workspace);
         $statement = $pdo->prepare('DELETE FROM signals WHERE name = :name AND value = :value');
-        $statement->execute(['name' => $registration, 'value' => $address]);
-        fclose($listener);
+        $statement->execute(['name' => $registration, 'value' => '1']);
+        $statement->closeCursor();
     }
 }
 

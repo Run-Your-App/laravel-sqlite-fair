@@ -18,6 +18,9 @@
         "pestphp/pest-plugin-laravel": "^4.1",
         "phpstan/phpstan": "^2.2"
     },
+    "suggest": {
+        "ext-inotify": "Required on Linux for the auto and native wait strategies; explicit polling does not require it."
+    },
     "autoload": {
         "psr-4": {
             "RunYourApp\\LaravelSqliteFair\\": "src/"

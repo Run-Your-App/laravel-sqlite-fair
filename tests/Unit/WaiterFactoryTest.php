@@ -12,6 +12,7 @@ it('reports the deterministic host capability matrix', function (string $family,
 })->with([
     ['Linux', true, ['platform' => 'linux', 'waiter' => 'inotify', 'available' => true]],
     ['Linux', false, ['platform' => 'linux', 'waiter' => 'inotify', 'available' => false]],
+    ['Darwin', null, ['platform' => 'other', 'waiter' => 'polling', 'available' => true]],
     ['Windows', null, ['platform' => 'other', 'waiter' => 'polling', 'available' => true]],
 ]);
 

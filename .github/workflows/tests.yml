@@ -11,9 +11,22 @@ permissions:
 
 jobs:
   tests:
-    name: Linux native and polling
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux native and polling
+            extensions: pdo_sqlite, inotify
+          - os: macos-latest
+            name: macOS polling
+            extensions: pdo_sqlite
+          - os: windows-latest
+            name: Windows polling
+            extensions: pdo_sqlite
 
     steps:
       - name: Checkout
@@ -23,7 +36,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: pdo_sqlite, inotify
+          extensions: ${{ matrix.extensions }}
           coverage: none
           tools: composer:v2
         env:

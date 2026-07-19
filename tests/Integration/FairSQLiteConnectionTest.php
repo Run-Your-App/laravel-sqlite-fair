@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\DeadlockException;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionCommitting;
@@ -576,13 +577,27 @@ test('normal writes are fair while reads remain ticket free', function (): void 
         ->and($this->connection->select('SELECT value FROM examples ORDER BY id'))->toHaveCount(2);
 });
 
-test('leading transaction control sql is rejected before state changes', function (string $sql): void {
-    $this->connection->unprepared($sql);
+test('write entry points reject leading transaction control sql', function (string $method, string $sql): void {
+    $this->connection->{$method}($sql);
 })->with([
-    'begin' => ' BEGIN IMMEDIATE',
-    'commit' => "\ncommit",
-    'rollback' => "\tRoLlBaCk",
+    'statement begin' => ['statement', ' BEGIN IMMEDIATE'],
+    'affecting statement commit' => ['affectingStatement', "\ncommit"],
+    'unprepared rollback' => ['unprepared', "\tRoLlBaCk"],
+    'nontransactional begin' => ['runNonTransactional', 'BEGIN'],
 ])->throws(LogicException::class);
+
+test('unprepared preserves Laravel raw sql semantics for batches and trigger bodies', function (): void {
+    expect($this->connection->unprepared("INSERT INTO examples (value) VALUES ('quoted;value'); -- trailing comment"))->toBeTrue()
+        ->and($this->connection->unprepared(
+            "INSERT INTO examples (value) VALUES ('batch-one'); INSERT INTO examples (value) VALUES ('batch-two')",
+        ))->toBeTrue()
+        ->and($this->connection->unprepared(
+            "CREATE TRIGGER mirror_example AFTER INSERT ON examples WHEN NEW.value = 'source' BEGIN INSERT INTO examples (value) VALUES ('trigger;value'); SELECT CASE WHEN NEW.value = 'source' THEN 1 ELSE 0 END; END;",
+        ))->toBeTrue()
+        ->and($this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['source']))->toBeTrue()
+        ->and($this->connection->table('examples')->orderBy('id')->pluck('value')->all())
+        ->toBe(['quoted;value', 'batch-one', 'batch-two', 'source', 'trigger;value']);
+});
 
 test('pretend writes and transactions only populate the query log', function (): void {
     $lock = new PDO('sqlite:'.$this->lockDirectory.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
@@ -710,15 +725,37 @@ test('eloquent and builder writes share queued implicit fairness while reads sta
     Exceptions::assertReported(PDOException::class);
 });
 
-test('run nontransactional requires exactly one write and returns its callback result', function (): void {
-    $result = $this->connection->runNonTransactional(function (FairSQLiteConnection $connection): string {
-        $connection->unprepared("INSERT INTO examples (value) VALUES ('nontransactional')");
+test('run nontransactional executes bound sql directly', function (): void {
+    $result = $this->connection->runNonTransactional(
+        'INSERT INTO examples (value) VALUES (?)',
+        ['direct-nontransactional'],
+    );
 
-        return 'kept';
+    expect($result)->toBeTrue()
+        ->and($this->connection->table('examples')->pluck('value')->all())->toBe(['direct-nontransactional']);
+});
+
+test('run nontransactional rejects blank sql before acquisition', function (): void {
+    expect(fn () => $this->connection->runNonTransactional(" \n\t"))
+        ->toThrow(LogicException::class, 'runNonTransactional() requires non-empty SQL.');
+});
+
+test('run nontransactional reports a query listener failure after persisted success', function (): void {
+    Exceptions::fake();
+    $this->connection->getEventDispatcher()?->listen(QueryExecuted::class, static function (QueryExecuted $event): void {
+        if (str_contains($event->sql, 'listener-after-persist')) {
+            throw new RuntimeException('query listener failed after persisted nontransactional sql');
+        }
     });
 
-    expect($result)->toBe('kept')
-        ->and($this->connection->table('examples')->value('value'))->toBe('nontransactional');
+    $result = $this->connection->runNonTransactional(
+        'INSERT INTO examples (value) VALUES (?) /* listener-after-persist */',
+        ['persisted'],
+    );
+
+    expect($result)->toBeTrue()
+        ->and($this->connection->table('examples')->pluck('value')->all())->toBe(['persisted']);
+    Exceptions::assertReported(RuntimeException::class);
 });
 
 test('run nontransactional returns persisted success after cleanup failure and restores its local scope', function (): void {
@@ -747,13 +784,12 @@ test('run nontransactional returns persisted success after cleanup failure and r
         'stale_head_seconds' => 0.001, 'wait_strategy' => 'polling',
     ], $appPath, $lockPath);
 
-    $result = $connection->runNonTransactional(function (FairSQLiteConnection $active): string {
-        $active->statement('INSERT INTO writes (value) VALUES (?)', ['nontransactional-cleanup']);
-
-        return 'kept-result';
-    });
+    $result = $connection->runNonTransactional(
+        'INSERT INTO writes (value) VALUES (?)',
+        ['nontransactional-cleanup'],
+    );
     $lock = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    expect($result)->toBe('kept-result')
+    expect($result)->toBeTrue()
         ->and($connection->table('writes')->where('value', 'nontransactional-cleanup')->count())->toBe(1)
         ->and($connection->transactionLevel())->toBe(0)
         ->and($connection->getPdo()->inTransaction())->toBeFalse()
@@ -769,19 +805,33 @@ test('run nontransactional returns persisted success after cleanup failure and r
         ->and((int) $lock->query('SELECT COUNT(*) FROM tickets')->fetchColumn())->toBe(0);
 });
 
-test('run nontransactional rejects zero writes recursion transactions and second writes', function (string $branch): void {
-    $this->connection->runNonTransactional(function (FairSQLiteConnection $connection) use ($branch): void {
-        match ($branch) {
-            'zero' => null,
-            'recursive' => $connection->runNonTransactional(static fn (): null => null),
-            'transaction' => $connection->beginTransaction(),
-            'second' => (function () use ($connection): void {
-                $connection->statement('INSERT INTO examples (value) VALUES (?)', ['first']);
-                $connection->statement('INSERT INTO examples (value) VALUES (?)', ['second']);
-            })(),
-        };
+test('run nontransactional rejects active transactions before acquisition', function (): void {
+    $this->connection->beginTransaction();
+
+    try {
+        expect(fn () => $this->connection->runNonTransactional(
+            'INSERT INTO examples (value) VALUES (?)',
+            ['blocked'],
+        ))->toThrow(LogicException::class);
+        expect($this->connection->table('examples')->count())->toBe(0);
+    } finally {
+        $this->connection->rollBack();
+    }
+});
+
+test('run nontransactional rejects reentrant fair writes before business sql', function (): void {
+    $this->connection->beforeExecuting(function (string $query, array $bindings, FairSQLiteConnection $connection): void {
+        if (str_contains($query, 'outer-nontransactional')) {
+            $connection->statement('INSERT INTO examples (value) VALUES (?)', ['reentrant']);
+        }
     });
-})->with(['zero', 'recursive', 'transaction', 'second'])->throws(LogicException::class);
+
+    expect(fn () => $this->connection->runNonTransactional(
+        'INSERT INTO examples (value) VALUES (?) /* outer-nontransactional */',
+        ['outer'],
+    ))->toThrow(LogicException::class)
+        ->and($this->connection->table('examples')->count())->toBe(0);
+});
 
 test('wait timeout scopes preserve results and permit one top level fair operation', function (): void {
     $result = $this->connection->withWaitTimeout(1.0, function (FairSQLiteConnection $connection): string {
@@ -1201,6 +1251,71 @@ test('set pdo keeps the existing pdo when replacement coordination cannot be bui
         ->and($failure)->toBeInstanceOf(FairSQLiteException::class);
 });
 
+test('constructor and set pdo reject non exception error modes without replacing runtime state', function (): void {
+    $workspace = $this->workspace.'/pdo-error-mode';
+    mkdir($workspace, 0775, true);
+    $appPath = $workspace.'/app.sqlite';
+    touch($appPath);
+    $lockPath = $workspace.'/lock';
+    $silentPdo = new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_SILENT]);
+
+    expect(fn () => new FairSQLiteConnection($silentPdo, $appPath, '', [
+        'driver' => 'fair-sqlite',
+        'name' => 'silent-constructor-'.str_replace('.', '-', uniqid('', true)),
+        'database' => $appPath,
+        'prefix' => '',
+        'lock_directory' => $lockPath,
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+    ], $appPath, $lockPath))->toThrow(FairSQLiteException::class);
+
+    $originalPdo = $this->connection->getPdo();
+    expect(fn () => $this->connection->setPdo($silentPdo))->toThrow(FairSQLiteException::class)
+        ->and($this->connection->getRawPdo())->toBe($originalPdo)
+        ->and($this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['still-usable']))->toBeTrue();
+});
+
+test('set pdo rejects deferred resolvers without changing the active pdo', function (): void {
+    $originalPdo = $this->connection->getPdo();
+
+    expect(fn () => $this->connection->setPdo(static fn (): PDO => $originalPdo))
+        ->toThrow(FairSQLiteException::class)
+        ->and($this->connection->getRawPdo())->toBe($originalPdo);
+});
+
+test('runtime operations reject an active pdo whose error mode was mutated', function (): void {
+    $pdo = $this->connection->getPdo();
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_SILENT);
+
+    try {
+        expect(fn () => $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['must-not-run']))
+            ->toThrow(FairSQLiteException::class);
+        expect((new PDO('sqlite:'.$this->databasePath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]))
+            ->query('SELECT COUNT(*) FROM examples')->fetchColumn())->toBe(0);
+    } finally {
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    }
+});
+
+test('commit revalidates exception mode after the committing event', function (): void {
+    $this->connection->getEventDispatcher()?->listen(TransactionCommitting::class, static function (TransactionCommitting $event): void {
+        $event->connection->getPdo()->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_SILENT);
+    });
+    $this->connection->beginTransaction();
+    $this->connection->statement('INSERT INTO examples (value) VALUES (?)', ['must-stay-uncommitted']);
+
+    expect(fn () => $this->connection->commit())->toThrow(FairSQLiteException::class)
+        ->and($this->connection->transactionLevel())->toBe(1)
+        ->and($this->connection->getRawPdo()?->inTransaction())->toBeTrue();
+
+    $observer = new PDO('sqlite:'.$this->databasePath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    expect((int) $observer->query('SELECT COUNT(*) FROM examples')->fetchColumn())->toBe(0);
+
+    $this->connection->getRawPdo()?->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $this->connection->setEventDispatcher(new Dispatcher);
+    $this->connection->rollBack();
+});
+
 test('a disconnected fair connection reconnects before the next write acquisition', function (): void {
     $workspace = $this->workspace.'/automatic-reconnect';
     mkdir($workspace, 0775, true);
@@ -1244,9 +1359,7 @@ test('queued cleanup failure preserves commit rollback and callback priorities',
         'wait_strategy' => 'polling',
     ], 'cleanup-'.$outcome.'-'.str_replace('.', '-', uniqid('', true)));
     $connection->unprepared('CREATE TABLE writes (value TEXT NOT NULL)');
-    $connection->runNonTransactional(static function (FairSQLiteConnection $active): void {
-        $active->statement('INSERT INTO writes (value) VALUES (?)', ['bootstrap']);
-    });
+    $connection->runNonTransactional('INSERT INTO writes (value) VALUES (?)', ['bootstrap']);
     $lockPdo = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $lockPdo->exec('INSERT INTO tickets DEFAULT VALUES');
 
@@ -1321,9 +1434,7 @@ test('debug logging reports representative bootstrap and ticket transitions', fu
         'wait_strategy' => 'polling',
         'debug' => true,
     ], 'debug-transitions-'.str_replace('.', '-', uniqid('', true)));
-    $connection->runNonTransactional(static function (FairSQLiteConnection $active): void {
-        $active->unprepared('CREATE TABLE debug_writes (value TEXT NOT NULL)');
-    });
+    $connection->runNonTransactional('CREATE TABLE debug_writes (value TEXT NOT NULL)');
 
     Log::shouldHaveReceived('debug')->withArgs(
         static fn (string $message, array $context): bool => $message === 'Fair SQLite transition.'

@@ -6,6 +6,7 @@ namespace RunYourApp\LaravelSqliteFair\Laravel;
 
 use Illuminate\Database\Connectors\SQLiteConnector;
 use Illuminate\Database\SQLiteConnection;
+use PDO;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use Throwable;
@@ -61,6 +62,7 @@ final class FairSQLiteConnector
         }
 
         $fairConfig = $this->fairConfig($config);
+        $this->assertExceptionModeOption($config);
         $appPath = $this->resolveDatabasePath($database);
         $lockPath = $this->resolveLockDirectory($fairConfig['lock_directory']);
 
@@ -130,6 +132,28 @@ final class FairSQLiteConnector
             'wait_strategy' => $waitStrategy,
             'debug' => $debug,
         ];
+    }
+
+    /**
+     * Rejects PDO error-mode overrides that would invalidate fair-lock error handling.
+     *
+     * Laravel supplies exception mode by default. File-backed Fair SQLite connections
+     * may retain other PDO options, but an explicit error-mode override must preserve
+     * that invariant exactly.
+     *
+     * @param  array<string, mixed>  $config  Validated file-backed connection configuration.
+     * @return void The method returns only when exception mode remains guaranteed.
+     *
+     * @throws FairSQLiteException When an explicit PDO error mode is not the strict exception-mode integer.
+     */
+    private function assertExceptionModeOption(array $config): void
+    {
+        $options = $config['options'] ?? [];
+        if (is_array($options)
+            && array_key_exists(PDO::ATTR_ERRMODE, $options)
+            && $options[PDO::ATTR_ERRMODE] !== PDO::ERRMODE_EXCEPTION) {
+            throw new FairSQLiteException('Fair SQLite requires PDO exception error mode.');
+        }
     }
 
     /**

@@ -2,12 +2,14 @@
 
 declare(strict_types=1);
 
+use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Support\Facades\Facade;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteConnection;
+use RunYourApp\LaravelSqliteFair\Laravel\FairSQLiteConnector;
 use RunYourApp\LaravelSqliteFair\Lock\LockDatabase;
 use RunYourApp\LaravelSqliteFair\Wait\PollingWaiter;
 use RunYourApp\LaravelSqliteFair\Wait\Waiter;
@@ -465,29 +467,24 @@ function runUnknownCommit(string $workspace): void
         exit(98);
     } catch (FairSQLiteException) {
     }
-    $resolverCalls = 0;
     try {
-        new FairSQLiteConnection(
-            static function () use (&$resolverCalls, $appPath): PDO {
-                $resolverCalls++;
-
-                return new PDO('sqlite:'.$appPath, options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-            },
-            $appPath,
-            '',
-            $config,
-            $appPath,
-            $lockPath,
-        );
+        $container = new Container;
+        Container::setInstance($container);
+        $container->instance('config', new Repository([
+            'sqlite-fair' => [
+                'lock_directory' => $lockPath,
+                'stale_head_seconds' => 10.0,
+                'wait_strategy' => 'polling',
+                'debug' => false,
+            ],
+        ]));
+        (new FairSQLiteConnector)->connect($config, 'unknown-commit');
         exit(99);
     } catch (FairSQLiteException) {
     }
-    if ($resolverCalls !== 0) {
-        exit(100);
-    }
     gc_collect_cycles();
     if ($weak->get() !== null) {
-        exit(101);
+        exit(100);
     }
     echo 'retired-and-released';
 }
@@ -535,9 +532,7 @@ function runUnknownRollback(string $workspace, array $arguments): void
     ];
     $connection = new FairSQLiteConnection($pdo, $appPath, '', $config, $appPath, $lockPath);
     if ($mode === 'nontransactional') {
-        $connection->runNonTransactional(
-            static fn (FairSQLiteConnection $connection): bool => $connection->statement("INSERT INTO writes (value) VALUES ('bootstrap')"),
-        );
+        $connection->runNonTransactional("INSERT INTO writes (value) VALUES ('bootstrap')");
         $observer = new PDO('sqlite:'.$lockPath.'/lock.sqlite', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         $observer->exec('CREATE TABLE cleanup_audit (attempts INTEGER NOT NULL)');
         $observer->exec('INSERT INTO cleanup_audit VALUES (0)');
@@ -557,7 +552,7 @@ function runUnknownRollback(string $workspace, array $arguments): void
             $connection->rollBack(1);
         } elseif ($mode === 'nontransactional') {
             $expectedLevel = 0;
-            $connection->runNonTransactional(static fn (): null => null);
+            $connection->runNonTransactional('SELECT 1');
         } else {
             $connection->beginTransaction();
             $connection->rollBack();
@@ -582,7 +577,7 @@ function runUnknownRollback(string $workspace, array $arguments): void
     } catch (FairSQLiteException) {
     }
     try {
-        $connection->runNonTransactional(static fn (): null => null);
+        $connection->runNonTransactional('SELECT 1');
         exit(85);
     } catch (FairSQLiteException) {
     }

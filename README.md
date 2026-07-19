@@ -133,15 +133,18 @@ The callback must start exactly one top-level fair write or outer transaction. T
 
 ## Non-Transactional Maintenance
 
-SQLite commands such as `VACUUM` cannot run inside a transaction. `runNonTransactional()` provides an always-ticketed scope for exactly one such write:
+SQLite commands such as `VACUUM` cannot run inside a transaction. `runNonTransactional()` accepts SQL plus optional bindings and keeps that nontransactional execution always ticketed:
 
 ```php
-$vacuumed = $connection->runNonTransactional(
-    fn (FairSQLiteConnection $connection): bool => $connection->unprepared('VACUUM'),
+$vacuumed = $connection->runNonTransactional('VACUUM');
+
+$changed = $connection->runNonTransactional(
+    'DELETE FROM maintenance_queue WHERE id = ?',
+    [$jobId],
 );
 ```
 
-The callback receives the active connection and must execute exactly one `statement()`, `affectingStatement()`, or `unprepared()` call. It always uses a ticket and is never retried. Active transactions, recursion, transaction starts, zero writes, or a second write throw `LogicException`.
+The connection rejects blank SQL and leading `BEGIN`, `COMMIT`, or `ROLLBACK` before ticket acquisition and never exposes a caller callback after persistence. It does not parse, split, or normalize SQL; Laravel and PDO retain their raw-SQL semantics. The execution always uses a ticket and is never retried. Once PDO confirms the autocommit statement, query-listener and ticket-cleanup failures are reported without changing the successful result. Active transactions and reentrant fair writes throw `LogicException`.
 
 ## Failure and Crash Semantics
 

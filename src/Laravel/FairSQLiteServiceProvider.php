@@ -10,6 +10,7 @@ use Illuminate\Database\SQLiteConnection;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Worker;
 use Illuminate\Support\ServiceProvider;
+use Override;
 
 /**
  * Registers Fair SQLite integration for Laravel applications.
@@ -29,6 +30,7 @@ final class FairSQLiteServiceProvider extends ServiceProvider
      *
      * @return void The provider registration is applied directly to Laravel's container.
      */
+    #[Override]
     public function register(): void
     {
         $this->mergeConfigFrom(dirname(__DIR__, 2).'/config/sqlite-fair.php', 'sqlite-fair');

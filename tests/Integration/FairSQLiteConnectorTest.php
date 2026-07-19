@@ -50,6 +50,22 @@ test('manually isolated provider runtime registers the fair sqlite driver', func
         ->and($connection->getConfig('driver'))->toBe('fair-sqlite');
 });
 
+test('provider registers the fair driver after the database manager was already resolved', function (): void {
+    $databaseManager = app('db');
+    $this->app->register(FairSQLiteServiceProvider::class);
+    config()->set('database.connections.resolved-package', [
+        'driver' => 'fair-sqlite',
+        'database' => $this->databasePath,
+        'prefix' => '',
+        'lock_directory' => $this->lockDirectory,
+        'wait_strategy' => 'polling',
+        'stale_head_seconds' => 10.0,
+        'debug' => false,
+    ]);
+
+    expect($databaseManager->connection('resolved-package'))->toBeInstanceOf(FairSQLiteConnection::class);
+});
+
 test('provider publishes exactly the package configuration with its dedicated tag', function (): void {
     $this->app->register(FairSQLiteServiceProvider::class);
 
@@ -174,6 +190,66 @@ test('file connections merge overrides and preserve upstream pdo options', funct
         ->and($connection->getTablePrefix())->toBe('p_')
         ->and($connection->getConfig('options'))->toBe([PDO::ATTR_TIMEOUT => 7]);
 });
+
+test('file connections apply upstream sqlite pragmas and restore busy timeout after a fair write', function (): void {
+    $connection = (new FairSQLiteConnector())->connect([
+        'driver' => 'fair-sqlite',
+        'database' => $this->databasePath,
+        'prefix' => '',
+        'lock_directory' => $this->lockDirectory,
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+        'debug' => false,
+        'foreign_key_constraints' => true,
+        'busy_timeout' => 2345,
+        'journal_mode' => 'DELETE',
+        'synchronous' => 'NORMAL',
+    ], 'pdo-effects-'.str_replace('.', '-', uniqid('', true)));
+
+    expect((int) $connection->scalar('PRAGMA foreign_keys'))->toBe(1)
+        ->and((int) $connection->scalar('PRAGMA busy_timeout'))->toBe(2345)
+        ->and(mb_strtolower((string) $connection->scalar('PRAGMA journal_mode')))->toBe('delete')
+        ->and((int) $connection->scalar('PRAGMA synchronous'))->toBe(1)
+        ->and($connection->statement('CREATE TABLE pdo_effects (value TEXT NOT NULL)'))->toBeTrue()
+        ->and((int) $connection->scalar('PRAGMA busy_timeout'))->toBe(2345);
+});
+
+test('file connections keep the lock database lazy until the first write', function (): void {
+    $connection = (new FairSQLiteConnector())->connect([
+        'driver' => 'fair-sqlite',
+        'database' => $this->databasePath,
+        'prefix' => '',
+        'lock_directory' => $this->lockDirectory,
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+        'debug' => false,
+    ], 'lazy-lock-'.str_replace('.', '-', uniqid('', true)));
+
+    expect(is_file($this->lockDirectory.'/lock.sqlite'))->toBeFalse()
+        ->and($connection->select('SELECT 1 AS value')[0]->value)->toBe(1)
+        ->and(is_file($this->lockDirectory.'/lock.sqlite'))->toBeFalse()
+        ->and($connection->statement('CREATE TABLE lazy_lock_write (value TEXT NOT NULL)'))->toBeTrue()
+        ->and(is_file($this->lockDirectory.'/lock.sqlite'))->toBeTrue();
+});
+
+test('file connections reject non exception pdo error modes before fair side effects', function (mixed $mode): void {
+    expect(is_dir($this->lockDirectory))->toBeFalse();
+
+    (new FairSQLiteConnector())->connect([
+        'driver' => 'fair-sqlite',
+        'database' => $this->databasePath,
+        'prefix' => '',
+        'lock_directory' => $this->lockDirectory,
+        'stale_head_seconds' => 10.0,
+        'wait_strategy' => 'polling',
+        'debug' => false,
+        'options' => [PDO::ATTR_ERRMODE => $mode],
+    ], 'invalid-error-mode-'.str_replace('.', '-', uniqid('', true)));
+})->with([
+    'silent' => PDO::ERRMODE_SILENT,
+    'warning' => PDO::ERRMODE_WARNING,
+    'non strict exception value' => [(string) PDO::ERRMODE_EXCEPTION],
+])->throws(FairSQLiteException::class);
 
 test('file connections reject invalid fair configuration without coercion', function (string $key, mixed $value): void {
     (new FairSQLiteConnector())->connect([

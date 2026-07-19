@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
+use Override;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 
 /**
@@ -48,6 +49,7 @@ final class PollingWaiter implements Waiter
      *
      * @return void The next complete wait starts at 100 microseconds.
      */
+    #[Override]
     public function beginContention(): void
     {
         $this->intervalMicroseconds = self::INITIAL_MICROSECONDS;
@@ -61,6 +63,7 @@ final class PollingWaiter implements Waiter
      *
      * @return void The current polling interval remains ready for the state check.
      */
+    #[Override]
     public function arm(): void {}
 
     /**
@@ -68,6 +71,7 @@ final class PollingWaiter implements Waiter
      *
      * @return void No buffered event state exists to consume.
      */
+    #[Override]
     public function drain(): void {}
 
     /**
@@ -83,6 +87,7 @@ final class PollingWaiter implements Waiter
      *
      * @throws FairSQLiteException When time_nanosleep() reports a terminal failure.
      */
+    #[Override]
     public function block(?float $deadline, callable $monotonic): void
     {
         $sleepMicroseconds = $this->intervalMicroseconds;

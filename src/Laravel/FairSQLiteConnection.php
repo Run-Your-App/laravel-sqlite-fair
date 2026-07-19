@@ -9,6 +9,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\DeadlockException;
 use Illuminate\Database\SQLiteConnection;
 use LogicException;
+use Override;
 use PDO;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairWaitTimeoutException;
@@ -64,8 +65,6 @@ final class FairSQLiteConnection extends SQLiteConnection
 
     private bool $nonTransactionalScope = false;
 
-    private int $nonTransactionalWrites = 0;
-
     private int $waitScopeDepth = 0;
 
     private int $waitScopeTopLevelCalls = 0;
@@ -79,7 +78,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * constructor rejects ambiguous or retired identities before installing the private lock database and host waiter.
      * Tests may supply the optional clock to verify deadline behavior without wall-clock delays.
      *
-     * @param  PDO|Closure  $pdo  Eager application PDO or Laravel PDO resolver.
+     * @param  PDO  $pdo  Eager application PDO.
      * @param  string  $database  Canonical application database path used by Laravel.
      * @param  string  $tablePrefix  Laravel table prefix retained for query and schema builders.
      * @param  array<string, mixed>  $config  Validated Laravel and Fair SQLite connection values.
@@ -94,7 +93,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @internal Laravel applications obtain this connection through the `fair-sqlite` driver.
      */
     public function __construct(
-        PDO|Closure $pdo,
+        PDO $pdo,
         string $database,
         string $tablePrefix,
         array $config,
@@ -102,6 +101,8 @@ final class FairSQLiteConnection extends SQLiteConnection
         string $lockPath,
         ?callable $monotonic = null,
     ) {
+        self::assertExceptionMode($pdo);
+
         $name = $config['name'] ?? null;
         if (! is_string($name) || $name === '') {
             throw new FairSQLiteException('A fair SQLite connection requires a non-empty connection name.');
@@ -219,6 +220,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When acquisition, the callback, rollback, cleanup, commit, or Laravel finalization fails.
      */
+    #[Override]
     public function transaction(Closure $callback, $attempts = 1)
     {
         for ($currentAttempt = 1; $currentAttempt <= $attempts; $currentAttempt++) {
@@ -242,7 +244,7 @@ final class FairSQLiteConnection extends SQLiteConnection
                     $this->rollBack();
                 } catch (Throwable $rollback) {
                     $rollbackSucceeded = false;
-                    report($rollback);
+                    $this->reportSecondaryFailure($rollback, 'transaction_callback_rollback');
                 }
 
                 if ($rollbackSucceeded
@@ -274,6 +276,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When acquisition, PDO, savepoint, manager, or event setup fails.
      */
+    #[Override]
     public function beginTransaction(): void
     {
         $this->assertUsable();
@@ -305,6 +308,7 @@ final class FairSQLiteConnection extends SQLiteConnection
         }
 
         $this->reconnectIfMissingConnection();
+        $this->assertActiveExceptionMode();
         $ticket = $this->fairLock()->acquire($this->consumeWaitDeadline());
         $this->activeTicket = $ticket;
         $this->fairFenceHeld = true;
@@ -323,7 +327,7 @@ final class FairSQLiteConnection extends SQLiteConnection
                 try {
                     $this->transactionsManager?->rollback($this->connectionName(), 0);
                 } catch (Throwable $managerRollback) {
-                    report($managerRollback);
+                    $this->reportSecondaryFailure($managerRollback, 'transaction_manager_begin_rollback');
                 }
             }
             throw $exception;
@@ -341,6 +345,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When the outer PDO commit has an unknown outcome or Laravel finalization fails.
      */
+    #[Override]
     public function commit(): void
     {
         $this->assertUsable();
@@ -355,8 +360,11 @@ final class FairSQLiteConnection extends SQLiteConnection
             return;
         }
 
+        $this->assertActiveExceptionMode();
+
         $levelBeingCommitted = $this->transactions;
         $this->fireConnectionEvent('committing');
+        $this->assertActiveExceptionMode();
         try {
             parent::getPdo()->commit();
         } catch (Throwable $exception) {
@@ -383,6 +391,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When PDO rollback, ticket cleanup, or Laravel finalization fails.
      */
+    #[Override]
     public function rollBack($toLevel = null): void
     {
         $this->assertUsable();
@@ -397,6 +406,8 @@ final class FairSQLiteConnection extends SQLiteConnection
 
             return;
         }
+
+        $this->assertActiveExceptionMode();
 
         try {
             if ($target === 0) {
@@ -441,6 +452,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When transaction-control SQL is supplied or fair acquisition, SQL, commit, or rollback fails.
      */
+    #[Override]
     public function statement($query, $bindings = []): bool
     {
         $this->rejectTransactionControl($query);
@@ -460,6 +472,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws Throwable When transaction-control SQL is supplied or fair acquisition, SQL, commit, or rollback fails.
      */
+    #[Override]
     public function affectingStatement($query, $bindings = []): int
     {
         $this->rejectTransactionControl($query);
@@ -468,16 +481,17 @@ final class FairSQLiteConnection extends SQLiteConnection
     }
 
     /**
-     * Executes one unprepared Laravel statement through fair writer coordination.
+     * Executes unprepared Laravel SQL through fair writer coordination.
      *
-     * Outside a transaction the statement receives its own outer fair transaction. This method never splits SQL and
-     * rejects only a leading `BEGIN`, `COMMIT`, or `ROLLBACK` token before execution.
+     * Outside a transaction the SQL receives its own outer fair transaction. Laravel and PDO retain ownership of raw
+     * SQL semantics, while leading transaction-control SQL remains unsupported by the fair lifecycle.
      *
      * @param  string  $query  Complete SQL statement passed to Laravel without bindings.
      * @return bool Whether PDO executed the statement successfully.
      *
      * @throws Throwable When transaction-control SQL is supplied or fair acquisition, SQL, commit, or rollback fails.
      */
+    #[Override]
     public function unprepared($query): bool
     {
         $this->rejectTransactionControl($query);
@@ -486,26 +500,31 @@ final class FairSQLiteConnection extends SQLiteConnection
     }
 
     /**
-     * Runs exactly one nontransactional write while its queue ticket remains owned.
+     * Runs nontransactional SQL while its queue ticket remains owned.
      *
-     * This method always joins the ticket queue, releases its temporary application fence, and invokes the callback in
-     * a scope that permits exactly one write call. The command is never replayed. Cleanup failure after a known
-     * successful write is logged while the callback result remains successful.
+     * This method rejects blank and leading transaction-control SQL before joining the ticket queue, releases its
+     * temporary application fence, and executes through Laravel's prepared statement path. The command is never
+     * replayed. Cleanup failure after a known successful write is logged while success remains successful.
      *
-     * @template TReturn
+     * @param  string  $query  Non-empty nontransactional SQL without leading transaction control.
+     * @param  array<array-key, mixed>  $bindings  Values bound by Laravel to the prepared statement.
+     * @return bool Whether Laravel executed the statement successfully.
      *
-     * @param  Closure(static): TReturn  $callback  Executes exactly one write with this connection.
-     * @return TReturn The callback result after the write and local scope finalization.
-     *
-     * @throws Throwable When the scope is nested, the callback performs other than one write, or acquisition or cleanup fails.
+     * @throws Throwable When the scope is nested or acquisition, SQL execution, rollback, or cleanup fails.
      */
-    public function runNonTransactional(Closure $callback): mixed
+    public function runNonTransactional(string $query, array $bindings = []): bool
     {
+        if (trim($query) === '') {
+            throw new LogicException('runNonTransactional() requires non-empty SQL.');
+        }
+        $this->rejectTransactionControl($query);
         $this->assertUsable();
         if ($this->transactions > 0 || $this->nonTransactionalScope) {
             throw new LogicException('runNonTransactional() requires an idle fair SQLite connection.');
         }
 
+        $this->reconnectIfMissingConnection();
+        $this->assertActiveExceptionMode();
         $ticket = $this->fairLock()->acquireQueued($this->consumeWaitDeadline());
         $this->activeTicket = $ticket;
         $this->fairFenceHeld = true;
@@ -518,12 +537,8 @@ final class FairSQLiteConnection extends SQLiteConnection
         }
 
         $this->nonTransactionalScope = true;
-        $this->nonTransactionalWrites = 0;
         try {
-            $result = $callback($this);
-            if ($this->consumeNonTransactionalWriteCount() !== 1) {
-                throw new LogicException('runNonTransactional() must execute exactly one write.');
-            }
+            $result = parent::statement($query, $bindings);
         } catch (Throwable $exception) {
             $this->cleanupAfterOriginalFailure();
             throw $exception;
@@ -534,11 +549,39 @@ final class FairSQLiteConnection extends SQLiteConnection
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
             FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'non_transactional']);
-            report($cleanup);
+            $this->reportSecondaryFailure($cleanup, 'non_transactional_cleanup');
         }
         $this->clearFairScope();
 
         return $result;
+    }
+
+    /**
+     * Keeps post-execution listener failures from turning a persisted nontransactional write into a retryable failure.
+     *
+     * Before-execution callbacks and PDO execution failures still propagate through Laravel's normal query path. The
+     * nontransactional scope is active here only after PDOStatement::execute() returned successfully, so an event
+     * failure is secondary to the already-persisted autocommit statement and is reported without changing its result.
+     *
+     * @param  string  $query
+     * @param  array<array-key, mixed>  $bindings
+     * @param  float|null  $time
+     */
+    #[Override]
+    public function logQuery($query, $bindings, $time = null): void
+    {
+        if (! $this->nonTransactionalScope) {
+            parent::logQuery($query, $bindings, $time);
+
+            return;
+        }
+
+        try {
+            parent::logQuery($query, $bindings, $time);
+        } catch (Throwable $exception) {
+            FairSQLiteDebug::log($this->debug, 'post_execute_listener_failed', ['operation' => 'non_transactional']);
+            $this->reportSecondaryFailure($exception, 'non_transactional_query_listener');
+        }
     }
 
     /**
@@ -601,6 +644,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @throws FairSQLiteException When the connection identity has already been retired.
      * @throws Throwable When the pretend callback fails.
      */
+    #[Override]
     public function pretend(Closure $callback): array
     {
         $this->assertUsable();
@@ -619,6 +663,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @throws FairSQLiteException When the identity has been retired.
      * @throws Throwable When Laravel cannot create the replacement PDO.
      */
+    #[Override]
     public function reconnect(): mixed
     {
         $this->assertUsable();
@@ -634,6 +679,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @return void The active PDO is released without clearing any retirement marker.
      */
+    #[Override]
     public function disconnect(): void
     {
         if ($this->hasUnknownPdoOutcome()) {
@@ -653,11 +699,14 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @throws FairSQLiteException When the identity has been retired.
      * @throws Throwable When Laravel's PDO resolver fails.
      */
+    #[Override]
     public function getPdo(): PDO
     {
         $this->assertUsable();
+        $pdo = parent::getPdo();
+        self::assertExceptionMode($pdo);
 
-        return parent::getPdo();
+        return $pdo;
     }
 
     /**
@@ -668,11 +717,14 @@ final class FairSQLiteConnection extends SQLiteConnection
      * @throws FairSQLiteException When the identity has been retired.
      * @throws Throwable When Laravel's PDO resolver fails.
      */
+    #[Override]
     public function getReadPdo(): PDO
     {
         $this->assertUsable();
+        $pdo = parent::getReadPdo();
+        self::assertExceptionMode($pdo);
 
-        return parent::getReadPdo();
+        return $pdo;
     }
 
     /**
@@ -682,6 +734,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws FairSQLiteException When the identity has been retired.
      */
+    #[Override]
     public function getRawPdo(): PDO|Closure|null
     {
         $this->assertUsable();
@@ -696,6 +749,7 @@ final class FairSQLiteConnection extends SQLiteConnection
      *
      * @throws FairSQLiteException When the identity has been retired.
      */
+    #[Override]
     public function getRawReadPdo(): PDO|Closure|null
     {
         $this->assertUsable();
@@ -706,38 +760,47 @@ final class FairSQLiteConnection extends SQLiteConnection
     /**
      * Replaces Laravel's PDO and installs matching Fair SQLite coordination state.
      *
-     * A concrete PDO receives a fresh waiter, lock-database handle, and application fence state before Laravel exposes
-     * that PDO. A resolver or null clears Fair SQLite state until Laravel supplies a concrete PDO. Retirement always
-     * blocks replacement.
+     * A concrete exception-mode PDO receives a fresh waiter, lock-database handle, and application fence state before
+     * Laravel exposes that PDO. Null clears Fair SQLite state for Laravel's disconnect lifecycle. Deferred resolvers
+     * are rejected because they cannot atomically install matching coordination state. Retirement always blocks replacement.
      *
-     * @param  PDO|Closure|null  $pdo  Concrete application PDO, deferred Laravel resolver, or null.
+     * @param  PDO|Closure|null  $pdo  Concrete application PDO or null; deferred Laravel resolvers are rejected.
      * @return static This connection after replacing its PDO state.
      *
      * @throws FairSQLiteException When the identity has been retired or coordination cannot be installed.
      * @throws Throwable When lock-database or native waiter startup fails for a concrete PDO.
      */
+    #[Override]
     public function setPdo($pdo): static
     {
         $this->assertUsable();
 
         if ($pdo instanceof PDO) {
+            self::assertExceptionMode($pdo);
             [$lockDatabase, $fairLock] = $this->buildFairRuntime($pdo);
             parent::setPdo($pdo);
             $this->lockDatabase = $lockDatabase;
             $this->fairLock = $fairLock;
-        } else {
+        } elseif ($pdo === null) {
             parent::setPdo($pdo);
             $this->fairLock = null;
             $this->lockDatabase = null;
+        } else {
+            throw new FairSQLiteException('Fair SQLite requires an eager PDO and does not accept deferred PDO resolvers.');
         }
 
         return $this;
     }
 
     /** @param array<array-key, mixed> $bindings */
+    #[Override]
     protected function run($query, $bindings, Closure $callback)
     {
         $this->assertUsable();
+        if (! $this->pretending()) {
+            $this->reconnectIfMissingConnection();
+            $this->assertActiveExceptionMode();
+        }
 
         return parent::run($query, $bindings, $callback);
     }
@@ -749,17 +812,11 @@ final class FairSQLiteConnection extends SQLiteConnection
     private function runFairWrite(Closure $write): mixed
     {
         $this->assertUsable();
+        if ($this->nonTransactionalScope) {
+            throw new LogicException('A nested fair write cannot run inside runNonTransactional().');
+        }
         if ($this->pretending() || $this->transactions > 0) {
             return $write();
-        }
-        if ($this->nonTransactionalScope) {
-            if ($this->nonTransactionalWrites >= 1) {
-                throw new LogicException('runNonTransactional() permits exactly one write.');
-            }
-            $result = $write();
-            $this->nonTransactionalWrites++;
-
-            return $result;
         }
 
         return $this->transaction(fn (): mixed => $write());
@@ -830,7 +887,7 @@ final class FairSQLiteConnection extends SQLiteConnection
             try {
                 $this->rollBack($previousLevel);
             } catch (Throwable $rollback) {
-                report($rollback);
+                $this->reportSecondaryFailure($rollback, 'framework_begin_rollback');
             }
 
             throw $exception;
@@ -849,7 +906,7 @@ final class FairSQLiteConnection extends SQLiteConnection
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
             FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'persisted_success']);
-            report($cleanup);
+            $this->reportSecondaryFailure($cleanup, 'persisted_success_cleanup');
         }
         $this->clearFairScope();
     }
@@ -861,7 +918,7 @@ final class FairSQLiteConnection extends SQLiteConnection
             $this->deleteActiveTicket();
         } catch (Throwable $cleanup) {
             FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'original_failure']);
-            report($cleanup);
+            $this->reportSecondaryFailure($cleanup, 'original_failure_cleanup');
         }
         $this->clearFairScope();
     }
@@ -878,7 +935,6 @@ final class FairSQLiteConnection extends SQLiteConnection
         $this->activeTicket = null;
         $this->fairFenceHeld = false;
         $this->nonTransactionalScope = false;
-        $this->nonTransactionalWrites = 0;
     }
 
     private function retireUnknownOutcome(Throwable $primary): void
@@ -892,10 +948,20 @@ final class FairSQLiteConnection extends SQLiteConnection
                 $fairLock->cleanupOwnTicket($this->activeTicket);
             } catch (Throwable $cleanup) {
                 FairSQLiteDebug::log($this->debug, 'cleanup_failed', ['operation' => 'unknown_outcome']);
-                report($cleanup);
+                $this->reportSecondaryFailure($cleanup, 'unknown_outcome_cleanup');
             }
         }
         $this->clearFairScope();
+    }
+
+    /** Report a secondary failure without allowing the reporting path to replace the primary database outcome. */
+    private function reportSecondaryFailure(Throwable $exception, string $operation): void
+    {
+        try {
+            report($exception);
+        } catch (Throwable) {
+            FairSQLiteDebug::log($this->debug, 'reporting_failed', ['operation' => $operation]);
+        }
     }
 
     private function markUnknownPdoOutcome(Throwable $exception): null
@@ -980,12 +1046,17 @@ final class FairSQLiteConnection extends SQLiteConnection
         return [$lockDatabase, $fairLock];
     }
 
-    private function consumeNonTransactionalWriteCount(): int
+    private function assertActiveExceptionMode(): void
     {
-        $count = $this->nonTransactionalWrites;
-        $this->nonTransactionalWrites = 0;
+        $pdo = parent::getPdo();
+        self::assertExceptionMode($pdo);
+    }
 
-        return $count;
+    private static function assertExceptionMode(PDO $pdo): void
+    {
+        if ($pdo->getAttribute(PDO::ATTR_ERRMODE) !== PDO::ERRMODE_EXCEPTION) {
+            throw new FairSQLiteException('Fair SQLite requires PDO exception error mode.');
+        }
     }
 
     private function connectionName(): string

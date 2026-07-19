@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace RunYourApp\LaravelSqliteFair\Wait;
 
+use Override;
 use RunYourApp\LaravelSqliteFair\Exceptions\FairSQLiteException;
 use RunYourApp\LaravelSqliteFair\Support\FairSQLiteDebug;
 
@@ -79,6 +80,7 @@ final class InotifyWaiter implements Waiter
      *
      * @return void The native adapter or its existing polling fallback is ready.
      */
+    #[Override]
     public function beginContention(): void
     {
         $this->polling?->beginContention();
@@ -95,6 +97,7 @@ final class InotifyWaiter implements Waiter
      *
      * @throws FairSQLiteException When the watch cannot be registered and degradation is not allowed.
      */
+    #[Override]
     public function arm(): void
     {
         if ($this->degraded) {
@@ -125,6 +128,7 @@ final class InotifyWaiter implements Waiter
      *
      * @return void Every currently buffered Inotify event has been consumed.
      */
+    #[Override]
     public function drain(): void
     {
         if (! $this->degraded) {
@@ -146,6 +150,7 @@ final class InotifyWaiter implements Waiter
      *
      * @throws FairSQLiteException When stream selection fails and degradation is not allowed.
      */
+    #[Override]
     public function block(?float $deadline, callable $monotonic): void
     {
         if ($this->degraded) {

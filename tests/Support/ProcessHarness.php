@@ -20,7 +20,7 @@ final class ProcessHarness
 
     private string $workspace;
 
-    /** @var Closure(array<int, string>, array<int, array{string, string}>, array<int, resource>&, string, array<string, mixed>): mixed */
+    /** @var Closure(array<int, string>, array<int, array{string, string, string}>, array<int, resource>&, string, array<string, mixed>): mixed */
     private Closure $startProcess;
 
     /**
@@ -29,7 +29,7 @@ final class ProcessHarness
      * The optional starter exists only for deterministic cleanup verification when a later child cannot be spawned.
      * Production-shaped process tests use PHP's native `proc_open()` through the default closure.
      *
-     * @param  (callable(array<int, string>, array<int, array{string, string}>, array<int, resource>&, string, array<string, mixed>): mixed)|null  $startProcess  Internal child-process construction seam.
+     * @param  (callable(array<int, string>, array<int, array{string, string, string}>, array<int, resource>&, string, array<string, mixed>): mixed)|null  $startProcess  Internal child-process construction seam.
      * @return void The harness is ready to initialize the workspace for one scenario.
      */
     public function __construct(?callable $startProcess = null)
@@ -86,8 +86,9 @@ final class ProcessHarness
     /**
      * Starts concurrent child programs and bounds their complete runtime.
      *
-     * The harness (1) starts every child before awaiting results, (2) drains stdout and stderr without serial pipe
-     * blocking, and (3) terminates the remaining group when the shared monotonic deadline expires.
+     * The harness (1) starts every child before awaiting results, (2) captures stdout and stderr in workspace files
+     * without platform-specific process-pipe behavior, and (3) terminates the remaining group when the shared
+     * monotonic deadline expires.
      *
      * @param  list<array{scenario: string, arguments?: array<string, int|string>}>  $specifications  Ordered child scenarios with scalar arguments.
      * @param  float  $timeoutSeconds  Finite positive seconds shared by the complete child group.
@@ -107,9 +108,17 @@ final class ProcessHarness
         }
 
         $deadline = hrtime(true) / 1e9 + $timeoutSeconds;
+        $stdinPath = $this->workspace.'/child-stdin';
+        $stdin = fopen($stdinPath, 'wb');
+        if ($stdin === false) {
+            throw new RuntimeException('The SQLite fair child input capture could not be created.');
+        }
+        fclose($stdin);
         $children = [];
         foreach ($specifications as $index => $child) {
             $pipes = [];
+            $stdoutPath = $this->workspace.'/child-'.$index.'.stdout';
+            $stderrPath = $this->workspace.'/child-'.$index.'.stderr';
             $startProcess = $this->startProcess;
             $process = $startProcess(
                 [
@@ -120,7 +129,11 @@ final class ProcessHarness
                     'log_errors=0',
                     $this->childDispatcherPath(),
                 ],
-                [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                [
+                    0 => ['file', $stdinPath, 'r'],
+                    1 => ['file', $stdoutPath, 'w'],
+                    2 => ['file', $stderrPath, 'w'],
+                ],
                 $pipes,
                 $this->workspace,
                 array_merge($_ENV, [
@@ -139,61 +152,41 @@ final class ProcessHarness
 
                 throw new RuntimeException('A SQLite fair child process could not be started.');
             }
-            fclose($pipes[0]);
-            stream_set_blocking($pipes[1], false);
-            stream_set_blocking($pipes[2], false);
             $children[$index] = [
                 'process' => $process,
-                'stdout_stream' => $pipes[1],
-                'stderr_stream' => $pipes[2],
-                'stdout' => '',
-                'stderr' => '',
+                'stdout_path' => $stdoutPath,
+                'stderr_path' => $stderrPath,
                 'scenario' => $child['scenario'],
             ];
         }
 
         $results = [];
         while ($children !== []) {
-            foreach ($children as $index => &$child) {
-                foreach (['stdout', 'stderr'] as $channel) {
-                    $chunk = stream_get_contents($child[$channel.'_stream']);
-                    if ($chunk !== false) {
-                        $child[$channel] .= $chunk;
-                    }
-                }
-
+            foreach ($children as $index => $child) {
                 $status = proc_get_status($child['process']);
                 if ($status['running']) {
                     continue;
                 }
 
-                foreach (['stdout', 'stderr'] as $channel) {
-                    $chunk = stream_get_contents($child[$channel.'_stream']);
-                    if ($chunk !== false) {
-                        $child[$channel] .= $chunk;
-                    }
-                    fclose($child[$channel.'_stream']);
-                }
                 $closedExitCode = proc_close($child['process']);
                 $results[$index] = [
                     'exit_code' => $status['exitcode'] >= 0 ? $status['exitcode'] : $closedExitCode,
-                    'stdout' => $child['stdout'],
-                    'stderr' => $child['stderr'],
+                    'stdout' => $this->readCapture($child['stdout_path']),
+                    'stderr' => $this->readCapture($child['stderr_path']),
                 ];
                 unset($children[$index]);
             }
-            unset($child);
 
             if ($children === []) {
                 break;
             }
             if (hrtime(true) / 1e9 >= $deadline) {
                 $blockedChildren = array_map(
-                    static fn (array $child): string => sprintf(
+                    fn (array $child): string => sprintf(
                         '%s (stdout: %s; stderr: %s)',
                         $child['scenario'],
-                        mb_substr($child['stdout'], 0, 1000),
-                        mb_substr($child['stderr'], 0, 1000),
+                        mb_substr($this->readCapture($child['stdout_path']), 0, 1000),
+                        mb_substr($this->readCapture($child['stderr_path']), 0, 1000),
                     ),
                     $children,
                 );
@@ -205,20 +198,7 @@ final class ProcessHarness
                 ));
             }
 
-            $read = [];
-            foreach ($children as $child) {
-                if (! feof($child['stdout_stream'])) {
-                    $read[] = $child['stdout_stream'];
-                }
-                if (! feof($child['stderr_stream'])) {
-                    $read[] = $child['stderr_stream'];
-                }
-            }
-            if ($read !== []) {
-                $write = [];
-                $except = [];
-                stream_select($read, $write, $except, 0, 50_000);
-            }
+            time_nanosleep(0, 10_000_000);
         }
 
         ksort($results);
@@ -227,13 +207,13 @@ final class ProcessHarness
     }
 
     /**
-     * Terminates every still-owned child and closes both output pipes.
+     * Terminates every still-owned child.
      *
      * This group cleanup is shared by spawn failures and deadline failures so no
      * earlier child can outlive a failed process-test group or retain SQLite locks.
      *
-     * @param  array<int, array{process: resource, stdout_stream: resource, stderr_stream: resource, stdout: string, stderr: string, scenario: string}>  $children  Children still owned by this harness call.
-     * @return void Every supplied process and output pipe has been released best-effort.
+     * @param  array<int, array{process: resource, stdout_path: string, stderr_path: string, scenario: string}>  $children  Children still owned by this harness call.
+     * @return void Every supplied process has been released best-effort.
      */
     private function terminateChildren(array $children): void
     {
@@ -244,11 +224,22 @@ final class ProcessHarness
                     @proc_terminate($child['process'], 9);
                 }
             }
-            $this->closePipes([$child['stdout_stream'], $child['stderr_stream']]);
             if (is_resource($child['process'])) {
                 @proc_close($child['process']);
             }
         }
+    }
+
+    private function readCapture(string $path): string
+    {
+        $capture = fopen($path, 'rb');
+        if ($capture === false) {
+            return '';
+        }
+        $contents = stream_get_contents($capture);
+        fclose($capture);
+
+        return $contents === false ? '' : $contents;
     }
 
     /** @param array<int, mixed> $pipes */
